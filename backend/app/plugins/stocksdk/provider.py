@@ -10,12 +10,15 @@ Original implementation by @forrany (PR #57), migrated to plugin architecture.
 from __future__ import annotations
 
 import logging
+import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from datetime import time as dtime
 
 import polars as pl
+import httpx
 
 from app.data_providers.base import AssetType
 from app.data_providers.normalizer import normalize_adj_factors, normalize_daily
@@ -30,6 +33,36 @@ _DATASETS = ("daily", "adj_factor", "minute", "realtime")
 # 每次桥接调用的符号数。桥接内部按 concurrency 并发, 分批仅为进度反馈与超时控制。
 _BATCH = 40
 _MINUTE_CANONICAL = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+
+
+def _f(v):
+    """安全数值转换: None/空/非数字 → None。"""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == "" or s == "-":
+        return None
+    try:
+        n = float(s)
+        return n if (n == n) else None  # 排除 NaN
+    except (ValueError, TypeError):
+        return None
+
+
+def _sina_get_with_retry(url: str, headers: dict, retries: int = 3) -> httpx.Response:
+    """带短退避重试的新浪 GET(网络抖动/SSL 握手偶发超时用)。"""
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            resp = httpx.get(url, headers=headers, timeout=12.0)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < retries:
+                time.sleep(1.0 * (attempt + 1))
+    assert last is not None
+    raise last
 
 
 @dataclass
@@ -268,10 +301,17 @@ class StockSDKProvider:
         return df.select(keep) if "datetime" in keep else pl.DataFrame()
 
     # ---- realtime (全市场快照) ----
-    def get_realtime(self) -> list[dict]:
-        logger.info("stock-sdk realtime 拉取开始(全市场快照)")
+    def get_realtime(self, symbols: list[str] | None = None) -> list[dict]:
+        """拉取实时行情。传 symbols(自选/指定) 时走腾讯单股报价(稳定可达)；
+        不传时走全市场快照(东财 clist, 绕过 linkdiary)。"""
+        if symbols:
+            logger.info("stock-sdk realtime 拉取开始(%d 只自选)", len(symbols))
+            job = {"op": "realtime", "symbols": list(symbols)}
+        else:
+            logger.info("stock-sdk realtime 拉取开始(全市场快照)")
+            job = {"op": "realtime"}
         try:
-            result = bridge.run_job({"op": "realtime"}, timeout=120)
+            result = bridge.run_job(job, timeout=120)
         except bridge.StockSDKBridgeError as e:
             logger.warning("stock-sdk realtime 拉取失败: %s", e)
             return []
@@ -288,6 +328,82 @@ class StockSDKProvider:
                 item["amount"] = float(item["amount"]) * 10_000
             normalized.append(item)
         return normalized
+
+    # ---- 指数实时 (新浪) ----
+    # TSP 核心四大指数(000001.SH/399001.SZ/399006.SZ/000680.SH)通过新浪 hq.sinajs.cn
+    # 独立接口拉取(s_sh000001/s_sz399001/s_sz399006/s_sh000680), 稳定不反爬。
+    # quote_service 通过 get_realtime_indices(symbols) 回调补拉指数, 与股票实时并存。
+    _SINA_INDEX_MAP = {
+        "000001.SH": "s_sh000001",
+        "399001.SZ": "s_sz399001",
+        "399006.SZ": "s_sz399006",
+        "000680.SH": "s_sh000680",
+    }
+
+    def get_realtime_indices(self, symbols: list[str] | None = None) -> list[dict]:
+        """拉取指定指数(默认核心四大指数)的实时快照。
+
+        返回与 get_realtime 同构的行(含 symbol), 便于 _process_full_market_records
+        按 symbol 识别为指数。新浪返回格式: 名称,现价,涨跌额,涨跌幅%,成交量,成交额。
+        """
+        if not symbols:
+            symbols = list(self._SINA_INDEX_MAP.keys())
+        wanted = [s for s in symbols if s in self._SINA_INDEX_MAP]
+        if not wanted:
+            return []
+        codes = ",".join(self._SINA_INDEX_MAP[s] for s in wanted)
+        url = f"https://hq.sinajs.cn/list={codes}"
+        headers = {
+            "Referer": "https://finance.sina.com.cn/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        try:
+            resp = _sina_get_with_retry(url, headers=headers, retries=3)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("新浪指数实时拉取失败: %s", e)
+            return []
+        rows: list[dict] = []
+        for line in resp.text.splitlines():
+            line = line.strip()
+            m = re.match(r'var hq_str_s_([a-z]+)(\d+)="([^"]*)"', line)
+            if not m:
+                continue
+            _exch, _code, payload = m.group(1), m.group(2), m.group(3)
+            fields = payload.split(",")
+            if len(fields) < 6:
+                continue
+            app_symbol = self._app_symbol_from_sina(_exch, _code)
+            if not app_symbol or app_symbol not in self._SINA_INDEX_MAP:
+                continue
+            try:
+                pct = _f(fields[3])
+                rows.append({
+                    "symbol": app_symbol,
+                    "name": fields[0].strip(),
+                    "last_price": _f(fields[1]),
+                    "prev_close": None,
+                    "open": None,
+                    "high": None,
+                    "low": None,
+                    "volume": _f(fields[4]),
+                    "amount": _f(fields[5]),
+                    "change_pct": (pct / 100) if pct is not None else None,  # 百分数→小数制
+                    "timestamp": int(time.time() * 1000),
+                })
+            except (ValueError, TypeError):
+                continue
+        return rows
+
+    @staticmethod
+    def _app_symbol_from_sina(exch: str, code: str) -> str | None:
+        e = exch.lower()
+        if e == "sh":
+            return f"{code}.SH"
+        if e == "sz":
+            return f"{code}.SZ"
+        if e == "bj":
+            return f"{code}.BJ"
+        return None
 
     # ---- instruments (标的维表) ----
     def get_instruments(self, asset_type: str = "stock") -> list[dict]:

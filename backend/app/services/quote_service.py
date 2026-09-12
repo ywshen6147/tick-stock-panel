@@ -668,6 +668,8 @@ class QuoteService:
                     t0 = time.perf_counter()
                     now_ts = time.perf_counter()
                     provider = custom_sources.get_provider(provider_name)
+                    # 全市场实时: stock-sdk bridge 默认走新浪分页(稳定不反爬),
+                    # 绕过 linkdiary 与东财反爬; provider.get_realtime() 无参即全市场。
                     records = provider.get_realtime()
                     # 指数补充: A 股快照通常不含指数。插件可选实现
                     # get_realtime_indices(symbols) 用独立端点补拉 (如 fuyao 指数快照);

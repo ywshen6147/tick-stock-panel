@@ -1,0 +1,26 @@
+# Vibe-Astock —— 需 Python 3.10+（akshare 新版语法）；实测 3.12
+# 编排引擎（借自 TradingAgents-astock）+ MiMo LLM
+langgraph>=0.6
+langchain-core>=0.3
+langchain-openai>=0.3
+pydantic>=2
+python-dotenv>=1
+
+# Web 后端（server.py）
+fastapi>=0.110
+uvicorn>=0.29
+
+# 数据层
+requests
+akshare>=1.18
+
+# 行业资金流那个接口要 JS 引擎解同花顺的混淆脚本。
+# 必须是改名后的 mini-racer，**不能装旧的 py_mini_racer**：
+# 两个包会装进同一个 py_mini_racer/ 目录互相覆盖 —— 旧包的 Python 代码
+# 配上新包的二进制，调用时报 `dlsym(mr_eval_context): symbol not found`，
+# 表现是「板块资金 / 资金轮动」两块**静默空着**（接口 200、sectors: []）。
+# 已经装了旧包的：pip uninstall py_mini_racer && pip install --force-reinstall mini-racer
+mini-racer>=0.12
+
+# 开发/测试
+pytest>=8

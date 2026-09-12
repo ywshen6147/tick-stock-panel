@@ -38,6 +38,9 @@ from app.api import (
     stock_analysis,
     strategy,
     watchlist,
+    vibe_proxy,
+    commodity,
+    yahoo,
 )
 from app.api import auth as auth_api
 from app.api import settings as settings_api
@@ -471,6 +474,16 @@ app.include_router(core_router)
 app.include_router(auth_api.router)
 app.include_router(kline.router)
 app.include_router(watchlist.router)
+# vibe-astock 子应用：同进程同端口(3018)承载 vibe 全部路由（B1 方案 B）
+# vibe 路由 /api/review/latest 等 → 实际 /api/vibe/api/review/latest，与前端 vibe.ts 一致。
+# 容错：依赖(langgraph 等)缺失或 import 失败时不阻断 TSP 主功能，前端 vibe 页会提示不可用。
+try:
+    from app.vibe import embed as _vibe_embed
+    app.mount("/api/vibe", _vibe_embed.app, name="vibe")
+except Exception as _e:  # noqa: BLE001
+    logger.warning("vibe 子应用挂载失败（vibe 页面将不可用）: %s", _e)
+app.include_router(commodity.router)
+app.include_router(yahoo.router)
 app.include_router(screener.router)
 app.include_router(backtest.router)
 app.include_router(factors.router)
@@ -537,3 +550,4 @@ if _static.exists():
                 headers={"Cache-Control": "no-store, must-revalidate"},
             )
         return {"error": "frontend not built"}
+

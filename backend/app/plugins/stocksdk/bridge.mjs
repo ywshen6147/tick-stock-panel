@@ -115,6 +115,19 @@ function guessSuffix(code) {
   return ''
 }
 
+/** app 符号(600519.SH / 000001.SZ) → 腾讯实时接口代码(sh600519 / sz000001)。 */
+function toTencentCode(appSymbol) {
+  const s = String(appSymbol).trim()
+  const dot = s.lastIndexOf('.')
+  if (dot === -1) return ''
+  const code = s.slice(0, dot)
+  const suffix = s.slice(dot + 1).toUpperCase()
+  if (suffix === 'SH') return `sh${code}`
+  if (suffix === 'SZ') return `sz${code}`
+  if (suffix === 'BJ') return `bj${code}`
+  return ''
+}
+
 /** stock-sdk 的 adjust 取值是 '' | 'qfq' | 'hfq'（无 'none'）。这里做兼容映射。 */
 function normAdjust(v) {
   if (v === 'hfq') return 'hfq'
@@ -123,6 +136,13 @@ function normAdjust(v) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/** 安全数值转换：null/undefined/非数字 → null。 */
+function num(v) {
+  if (v == null || v === '' || v === '-') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
 
 /**
  * 上游(东财)偶发冷启动/限流时对活跃标的返回空数组(非报错)。对已知应有数据的请求，
@@ -196,13 +216,135 @@ async function opMinute(sdk, job) {
   return out
 }
 
-async function opRealtime(sdk, job) {
-  const { concurrency = 8 } = job
-  const all = await sdk.batch.cn({ concurrency })
+/**
+ * 全 A 股实时快照（新浪分页）。
+ * 上游 stock-sdk 的 batch.cn 依赖 assets.linkdiary.cn 的 A 股代码列表，
+ * 部分网络环境无法访问该域名（超时），导致整个实时行情拉取失败。
+ * 东财 clist 对脚本请求有反爬(偶发 502/HTML)。这里改用新浪
+ * vip.stock.finance.sina.com.cn（稳定、不反爬、Node 可直连）分页拉全市场，
+ * 绕过 linkdiary，保证实时功能可用。
+ */
+const SINA_PAGE_NUM = 80
+
+async function fetchSinaAllAShare() {
   const rows = []
-  for (const q of all || []) {
-    if (!q || !q.code) continue
-    rows.push({
+  let page = 1
+  const h = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    Referer: 'https://finance.sina.com.cn/',
+  }
+  for (; page <= 120; page++) {
+    const url =
+      'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/' +
+      'Market_Center.getHQNodeData' +
+      `?page=${page}&num=${SINA_PAGE_NUM}&sort=symbol&asc=1&node=hs_a&symbol=&_s_r_a=page`
+    const resp = await fetch(url, { headers: h })
+    if (!resp.ok) {
+      if (resp.status === 502 || resp.status >= 500) break // 新浪偶发限流, 已取到的返回
+      throw new Error(`sina getHQNodeData HTTP ${resp.status}`)
+    }
+    const text = await resp.text()
+    let json = null
+    try {
+      json = JSON.parse(text)
+    } catch {
+      break // 非 JSON 说明页尾/异常, 截断返回已取到的
+    }
+    if (!Array.isArray(json) || json.length === 0) break
+    rows.push(...json)
+    if (json.length < SINA_PAGE_NUM) break
+    await sleep(80)
+  }
+  return rows
+}
+
+function guessSuffixFromCode(code) {
+  const c = String(code)
+  // 东财 marketId: 1=SH, 0=SZ, 0(北交所用别的) —— 用代码规则兜底
+  if (/^(6|5|9)/.test(c)) return 'SH'
+  if (/^(0|3|1|2)/.test(c)) return 'SZ'
+  if (/^(4|8|92)/.test(c)) return 'BJ'
+  return ''
+}
+
+/** 新浪 symbol(sh600519) → app 符号(600519.SH)。 */
+function sinaSymbolToApp(sinaSym) {
+  const s = String(sinaSym || '').trim().toLowerCase()
+  if (/^sh/.test(s)) return `${s.slice(2)}.SH`
+  if (/^sz/.test(s)) return `${s.slice(2)}.SZ`
+  if (/^bj/.test(s)) return `${s.slice(2)}.BJ`
+  return s
+}
+
+async function fetchEastmoneyClistAll() {
+  const rows = []
+  let pn = 1
+  let total = Infinity
+  // 与 stock-sdk 相同的 token，东财接口稳定返回
+  const ut = 'bd1d9ddb04089700cf9c27f6f7426281'
+  for (; rows.length < total && pn <= 60; pn++) {
+    const url =
+      `https://push2.eastmoney.com/api/qt/clist/get?pn=${pn}&pz=${EM_CLIST_PAGE}` +
+      `&po=1&np=1&fltt=2&invt=2&fid=f3&fs=${encodeURIComponent(EM_CLIST_FS)}` +
+      `&fields=${encodeURIComponent(EM_CLIST_FIELDS)}&ut=${ut}`
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Referer: 'https://quote.eastmoney.com/',
+        Accept: 'application/json, text/plain, */*',
+      },
+    })
+    if (!resp.ok) throw new Error(`eastmoney clist HTTP ${resp.status}`)
+    const json = await resp.json()
+    const data = json && json.data
+    if (!data || !Array.isArray(data.diff)) break
+    total = data.total != null ? Number(data.total) : total
+    rows.push(...data.diff)
+    if (!data.diff.length) break
+    // 限速：东财 clist 分页过快可能触发风控
+    await sleep(120)
+  }
+  return rows
+}
+
+async function opRealtime(sdk, job) {
+  // 若显式指定 symbols，则走腾讯单股报价（qt.gtimg.cn，同样可达且不依赖 linkdiary）。
+  const requested = Array.isArray(job.symbols) ? job.symbols.filter(Boolean) : []
+  if (requested.length) {
+    // app 符号(600519.SH / 000001.SZ) → 腾讯格式(sh600519 / sz000001)
+    const tencentCodes = requested.map(toTencentCode).filter(Boolean)
+    const quotes = tencentCodes.length ? await sdk.quotes.cn(tencentCodes) : []
+    const rows = []
+    for (const q of quotes || []) {
+      if (!q || !q.code) continue
+      rows.push({
+        symbol: toAppSymbol(q.code, q.marketId),
+        name: q.name,
+        last_price: q.price,
+        prev_close: q.prevClose,
+        open: q.open,
+        high: q.high,
+        low: q.low,
+        volume: q.volume,
+        amount: q.amount,
+        change_pct: q.changePercent,
+        timestamp: q.timestamp,
+      })
+    }
+    return rows
+  }
+
+  // 默认：新浪全市场快照（绕过 linkdiary，新浪稳定不反爬）
+  let raw = []
+  try {
+    raw = await fetchSinaAllAShare()
+  } catch (e) {
+    // 新浪失败时回退到原 stock-sdk 路径（可能需要 linkdiary）
+    process.stderr.write(`[bridge] sina all-a failed: ${(e && e.message) || e}\n`)
+    const all = await sdk.batch.cn({ concurrency: job.concurrency || 8 })
+    raw = (all || []).map((q) => ({
       symbol: toAppSymbol(q.code, q.marketId),
       name: q.name,
       last_price: q.price,
@@ -214,6 +356,33 @@ async function opRealtime(sdk, job) {
       amount: q.amount,
       change_pct: q.changePercent,
       timestamp: q.timestamp,
+    }))
+    const rows = []
+    for (const it of raw || []) {
+      if (!it || !it.symbol) continue
+      rows.push(it)
+    }
+    return rows
+  }
+  const rows = []
+  for (const it of raw || []) {
+    // 新浪 symbol(sh600519) → app 符号
+    const symbol = sinaSymbolToApp(it.symbol)
+    if (!symbol) continue
+    const code = symbol.split('.')[0]
+    if (!code) continue
+    rows.push({
+      symbol,
+      name: it.name != null ? String(it.name) : '',
+      last_price: num(it.trade),
+      prev_close: num(it.settlement),
+      open: num(it.open),
+      high: num(it.high),
+      low: num(it.low),
+      volume: num(it.volume),
+      amount: num(it.amount),
+      change_pct: it.changepercent != null ? Number(it.changepercent) : null,
+      timestamp: it.trade != null ? Date.now() : null,
     })
   }
   return rows
