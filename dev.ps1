@@ -67,6 +67,16 @@ function Log-Ok  ($m) { Write-Host "[dev] $m" -ForegroundColor Green }
 function Log-Warn($m) { Write-Host "[dev] $m" -ForegroundColor Yellow }
 function Log-Err ($m) { Write-Host "[dev] $m" -ForegroundColor Red }
 
+# ===== 0. 上游更新检查（每次启动时） =====
+# 挂在这里而不是别处，是为了让「打开 TSP」这件事本身就带上更新检查。
+# 该脚本只会在**确认安全**时改本地代码（工作区干净 + 可快进 + 上游已含复权修复），
+# 否则只报告原因；网络不可达时静默跳过，绝不阻塞启动。
+# 详见 C:\Users\shen_\Documents\DSH\update-tsp.ps1
+$UpdScript = 'C:\Users\shen_\Documents\DSH\update-tsp.ps1'
+if (Test-Path $UpdScript) {
+    try { & $UpdScript -Quiet } catch { Log-Warn "上游更新检查跳过：$($_.Exception.Message)" }
+}
+
 # ===== 1. Dependency check =====
 function Require-Cmd($cmd, $hint) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
