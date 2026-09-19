@@ -247,7 +247,10 @@ def _apply_adj_factor(raw: pl.DataFrame, factors: pl.DataFrame) -> pl.DataFrame:
     """对 raw K 线应用前复权 (forward adjustment)。
 
     adj_factor 结构: symbol, trade_date, ex_factor
-    ex_factor 含义: 每次除权事件的 pre/post 比值(个股级,非累积)。
+
+    ex_factor 有两种口径, 上游不同数据源给的不一样, 必须先判别:
+      - 事件型: 每行是"该次除权的 pre/post 比值", 绝大多数交易行恰好 = 1.0
+      - 累积型: 每个交易日都给出"到该日为止的累积因子", 几乎每行都 ≠ 1.0
 
     前复权原理:
       - 保持最新价格不变,将历史价格向下调整以消除除权缺口
@@ -266,14 +269,48 @@ def _apply_adj_factor(raw: pl.DataFrame, factors: pl.DataFrame) -> pl.DataFrame:
     if factors.is_empty():
         return raw
 
-    # 去重 + 排序 + 累积乘积 (一趟完成)
+    # 去重 + 排序
     factors_sorted = (
         factors.sort(["symbol", "trade_date"])
         .unique(subset=["symbol", "trade_date"])
         .sort(["symbol", "trade_date"])
-        .with_columns(
-            pl.col("ex_factor").cum_prod().over("symbol").alias("cum_factor"),
+    )
+
+    # ---- ex_factor 口径判别 (见 docstring) ----
+    # 下游用 cum_prod() 累积。若数据源给的本来就是累积型, 再累积一次等于把同一个
+    # 因子连乘 N 次: 实测 688553.SH 因子表仅 5 行, 一年前价格被除 1.596^5 ≈ 10.4 倍
+    # (raw 23.67 → 2.27), 表现为"越往前的 K 线价格越小得越离谱"。
+    # 判据: 恰好等于 1.0 的行占比 —— 事件型绝大多数行 = 1.0, 累积型几乎没几行 = 1.0。
+    one_ratio = (
+        factors_sorted
+        .select((pl.col("ex_factor") - 1.0).abs().le(1e-9).mean())
+        .item()
+    )
+    is_cumulative = one_ratio is None or one_ratio < 0.5
+
+    prev_factor = pl.col("ex_factor").shift(1).over("symbol")
+    if is_cumulative:
+        logger.info(
+            "adj_factor 判定为累积型 (恰好=1.0 的行仅占 %.1f%%) → 归一成事件比值后再累积",
+            (one_ratio or 0.0) * 100.0,
         )
+        # 首行无从判断当日是否除权, 保守取 False。
+        # 该源的累积因子带 ~0.1% 的日间噪声(由价格比值推导而来), 若"一变即算除权"
+        # 会把每个交易日都标成除权日; 这里要求相对变动超过 0.5% 才算真除权事件。
+        # 注: 极小额分红(<0.5%)会被漏标 —— 该列当前无消费方, 保守优先。
+        rel_change = (pl.col("ex_factor") / prev_factor - 1.0).abs()
+        ex_flag = prev_factor.is_not_null() & (rel_change > 5e-3)
+        factors_sorted = factors_sorted.with_columns(
+            (pl.col("ex_factor") / prev_factor).fill_null(1.0).alias("ex_factor"),
+            ex_flag.alias("ex_flag"),
+        )
+    else:
+        # 事件型: 存在因子行的那天即除权日 (与改动前行为一致)
+        factors_sorted = factors_sorted.with_columns(pl.lit(True).alias("ex_flag"))
+
+    # 累积乘积 (一趟完成)
+    factors_sorted = factors_sorted.with_columns(
+        pl.col("ex_factor").cum_prod().over("symbol").alias("cum_factor"),
     )
 
     # 每个 symbol 的总累积因子
@@ -286,9 +323,8 @@ def _apply_adj_factor(raw: pl.DataFrame, factors: pl.DataFrame) -> pl.DataFrame:
     raw_sorted = raw.sort(["symbol", "date"])
 
     # join_asof backward: 每根 K 线取 <= 其 date 的最新累积因子
-    # 同时带 trade_date 列用于判断除权日标记
     df = raw_sorted.join_asof(
-        factors_sorted.select("symbol", "trade_date", "cum_factor"),
+        factors_sorted.select("symbol", "trade_date", "cum_factor", "ex_flag"),
         left_on="date",
         right_on="trade_date",
         by="symbol",
@@ -298,16 +334,15 @@ def _apply_adj_factor(raw: pl.DataFrame, factors: pl.DataFrame) -> pl.DataFrame:
     # 补充 total_factor + 前复权 + 除权标记,一次 with_columns 完成
     df = df.join(total_factors, on="symbol", how="left")
 
-    is_ex = pl.col("trade_date") == pl.col("date")
     ratio = pl.col("cum_factor").fill_null(1.0) / pl.col("total_factor").fill_null(1.0)
     price_cols = [c for c in ("open", "high", "low", "close") if c in df.columns]
 
     df = df.with_columns(
         [pl.col(c) * ratio for c in price_cols]
         + [
-            is_ex.alias("ex_rights"),
+            pl.col("ex_flag").fill_null(False).alias("ex_rights"),
         ]
-    ).drop(["trade_date", "cum_factor", "total_factor"])
+    ).drop(["trade_date", "cum_factor", "total_factor", "ex_flag"])
 
     return df
 
