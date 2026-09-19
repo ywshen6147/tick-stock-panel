@@ -82,7 +82,16 @@ def _merge_vr_routes() -> int:
     if not os.path.isdir(vr_dir):
         return 0
     if vr_dir not in sys.path:
-        sys.path.insert(0, vr_dir)   # 放最前，确保 `import astock` 等解析到 vr/ 内
+        # 必须「追加」而不是「插到最前」：vr/ 里有一个 app.py，插到 sys.path[0]
+        # 会让 `import app` 解析到 vr/app.py，从而遮住后端自己的 app 包。
+        # uvicorn --reload 的 reloader 会先用被污染的 sys.path 跑一遍，再 spawn
+        # worker；子进程继承 sys.path（multiprocessing 会带上），于是
+        # `import app.main` 直接失败：Could not import module "app.main"。
+        # 后果是 reloader 一直占着 :3018 不进入 Listen（端口停在 Bound），
+        # 前端外壳能开、所有 /api 失败 → 整页白屏，且应用从未加载所以一行日志都没有。
+        # 追加同样能让 `import astock` 等解析到 vr/ 内（已核对 vr/ 的 12 个模块名
+        # 与本 venv 的 site-packages 无同名冲突）。
+        sys.path.append(vr_dir)
     try:
         import app as vr_app  # noqa: PLC0415  vr/app.py（不是本仓库的模块）
 
@@ -227,7 +236,8 @@ def _add_vr_to_path() -> None:
     import sys
     vr_dir = os.path.join(_HERE, "vr")
     if os.path.isdir(vr_dir) and vr_dir not in sys.path:
-        sys.path.insert(0, vr_dir)
+        # 同上：必须追加。插到最前会用 vr/app.py 遮住后端的 app 包，破坏 --reload
+        sys.path.append(vr_dir)
 
 
 _VR_ROUTES = _merge_vr_routes()

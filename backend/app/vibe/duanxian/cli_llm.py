@@ -55,7 +55,8 @@ def _load_runtime():
     if mod is None:
         vr_dir = str(Path(__file__).resolve().parent.parent / "vr")
         if vr_dir not in sys.path:
-            sys.path.insert(0, vr_dir)
+            # 追加而非插到最前：避免 vr/app.py 遮住后端的 app 包（原因详见 vibe/server.py）
+            sys.path.append(vr_dir)
         import cli_runtime as mod  # noqa: PLC0415
     return mod
 

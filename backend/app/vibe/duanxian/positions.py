@@ -25,7 +25,10 @@ from typing import Optional
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _VR = os.path.join(os.path.dirname(_HERE), "vr")
 if _VR not in sys.path:                      # vr/ 是上游逐字副本，只读不改
-    sys.path.insert(0, _VR)
+    # 追加而非插到最前：_VR 里有 app.py，插到最前会遮住后端的 app 包，
+    # 使 uvicorn --reload 的 worker 无法 import app.main（表现为整页白屏）。
+    # 原因与影响面详见 vibe/server.py 中的同一处修改。
+    sys.path.append(_VR)
 
 
 def _quotes(codes: list[str]) -> dict:
