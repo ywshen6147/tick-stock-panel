@@ -201,7 +201,7 @@ export interface AiFinancialReport {
 }
 
 // ===== 个股分析 =====
-export type LevelType = 'sr' | 'pivot' | 'extreme' | 'boll' | 'keltner_s' | 'keltner_m' | 'keltner_l' | 'atr_stop' | 'gap' | 'fib' | 'round'
+export type LevelType = 'sr' | 'pivot' | 'extreme' | 'boll' | 'keltner_s' | 'keltner_m' | 'keltner_l' | 'atr_stop' | 'gap' | 'fib' | 'round' | 'turning'
 
 export interface PriceLevel {
   value: number
@@ -230,6 +230,120 @@ export interface StockLevels {
   /** dates 与 series 对齐;前端按自身 rows 的日期映射,缺失填 null */
   dates?: string[]
   series?: LevelSeries
+  /** 蔡森·多空转折顾问(形态结论 + 关键划线点位) */
+  turning?: TurningAnalysis
+}
+
+/** 蔡森·多空转折顾问 —— 划线标注(颈线/目标/止损,供 K 线图 markLine)。 */
+export interface TurningMark {
+  yAxis: number
+  name: string
+  style: 'orange' | 'purple' | 'green' | 'red'
+}
+
+/** 蔡森·多空转折顾问 —— 单个形态识别结果。 */
+export interface TurningPattern {
+  key: 'break_below_reverse' | 'double_bottom' | 'fake_breakout' | 'double_top' | 'box' | 'triangle' | 'trend'
+  name: string
+  direction: 'bull' | 'bear' | 'neutral'
+  confirmed: boolean
+  neckline?: number | null
+  target?: number | null
+  top?: number | null
+  bottom?: number | null
+  desc: string
+  marks: TurningMark[]
+  /** 收敛三角形专属:上下缘斜线锚点/斜率/动态价/尖点 */
+  upper_line?: { idx?: number; date?: string; value: number }[]
+  lower_line?: { idx?: number; date?: string; value: number }[]
+  up_slope?: number
+  lo_slope?: number
+  dyn_up?: number
+  dyn_lo?: number
+  apex_idx?: number | null
+  apex_val?: number | null
+  height?: number
+  /** 动态口径满足位(突破位 + 当日三角高度,近目标) */
+  dyn_target?: number | null
+  /** 静态口径满足位(突破颈线 + 全高,远目标) */
+  static_target?: number | null
+}
+
+/** 蔡森·多空转折顾问 —— K 线斜线(收敛三角形上下缘连线)。 */
+export interface TurningLine {
+  id: string
+  name: string
+  color: string
+  kind: 'uptrend' | 'downtrend' | 'horizontal'
+  /** 锚点(idx = 后端全量 K 线下标,date = 交易日,value = 价格;前端按 date 对齐) */
+  points: { idx?: number; date?: string; value: number }[]
+}
+
+/** 蔡森·多空转折顾问 —— 波段结构(第一波/回踩/第二波等幅)。 */
+export interface TurningWaves {
+  available: boolean
+  bottom?: number | null
+  first_wave_high?: number | null
+  first_wave_height?: number | null
+  pullback_low?: number | null
+  second_wave_target?: number | null
+  w_bottom_target?: number | null
+  break_reverse_target?: number | null
+}
+
+/** 蔡森·多空转折顾问 —— 操作纪律条目。 */
+export interface TurningDisciplineItem {
+  label: string
+  value: number
+  note: string
+}
+
+/** 蔡森·多空转折顾问 —— 操作纪律(确定性规则式,由形态/波段/价位自动推导)。 */
+export interface TurningDiscipline {
+  /** 观察区(回踩/站稳的结构位) */
+  entry: TurningDisciplineItem[]
+  /** 确认/加码区(带量突破位) */
+  add: TurningDisciplineItem[]
+  /** 减码区(满足位附近) */
+  reduce: TurningDisciplineItem[]
+  /** 防守位(跌破即结构走坏) */
+  stop: TurningDisciplineItem[]
+  /** 铁律(蔡森式纪律条文) */
+  rules: string[]
+}
+
+/** 蔡森·多空转折顾问 —— 分析结果(多形态深度版)。 */
+export interface TurningAnalysis {
+  /** 主形态: 破底翻 | W底/双底 | 向上假突破 | M头/双顶 | 箱体震荡 | 收敛三角形 | 多头/空头趋势 */
+  form: string
+  /** 多空结论: bull(偏多) | bear(偏空) | neutral(中性) */
+  verdict: 'bull' | 'bear' | 'neutral'
+  /** 颈线 */
+  neckline: number | null
+  /** 满足点(目标) */
+  target: number | null
+  /** 止损 */
+  stop: number | null
+  /** 置信度: 低 | 中 | 中高 */
+  confidence: string
+  desc: string
+  note: string
+  /** 划线标注(颈线/目标/止损,供 K 线图 markLine) */
+  marks: TurningMark[]
+  /** 关键价位(与 levels.turning 同源,可直接加入点位提醒) */
+  points: PriceLevel[]
+  /** 多形态识别结果(破底翻/W底/M头/假突破/箱体/三角形/趋势) */
+  patterns: TurningPattern[]
+  /** 波段结构(第一波/回踩/第二波等幅目标) */
+  waves: TurningWaves
+  /** K 线斜线(收敛三角形上下缘连线) */
+  lines?: TurningLine[]
+  /** 操作纪律(观察区/加码/减码/防守位 + 铁律) */
+  discipline?: TurningDiscipline
+  /** 一句话结论 */
+  summary: string
+  close?: number | null
+  symbol?: string
 }
 
 export interface AiStockReport {
@@ -3278,6 +3392,10 @@ export const api = {
   // ===== 个股分析 =====
   stockAnalysisLevels: (symbol: string, days = 120) =>
     request<StockLevels>(`/api/stock-analysis/levels?symbol=${encodeURIComponent(symbol)}&days=${days}`),
+
+  /** 蔡森·多空转折顾问 —— 形态识别 + 关键价位 + 划线标注 */
+  stockAnalysisTurning: (symbol: string, days = 120) =>
+    request<TurningAnalysis>(`/api/stock-analysis/turning?symbol=${encodeURIComponent(symbol)}&days=${days}`),
 
   stockAnalysisReportsList: () =>
     request<{ reports: AiStockReport[] }>('/api/stock-analysis/reports'),

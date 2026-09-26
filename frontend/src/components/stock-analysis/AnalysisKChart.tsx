@@ -31,7 +31,7 @@ const THEME = {
 const CT = () => chartTheme(getTheme())
 
 // ===== 价位类型(与后端 levels.py 的 LEVEL_TYPES 对齐) =====
-export type LevelType = 'sr' | 'pivot' | 'extreme' | 'boll' | 'keltner_s' | 'keltner_m' | 'keltner_l' | 'atr_stop' | 'gap' | 'fib' | 'round'
+export type LevelType = 'sr' | 'pivot' | 'extreme' | 'boll' | 'keltner_s' | 'keltner_m' | 'keltner_l' | 'atr_stop' | 'gap' | 'fib' | 'round' | 'turning'
 
 export interface PriceLevel {
   value: number
@@ -56,6 +56,7 @@ export const LEVEL_GROUPS: { key: LevelType; label: string; color: string }[] = 
   { key: 'gap',      label: '缺口位',    color: '#EC4899' },   // 粉
   { key: 'fib',      label: '斐波那契',  color: '#F59E0B' },   // 金
   { key: 'round',    label: '整数关口',  color: '#71717A' },   // 灰(心理位,弱视觉)
+  { key: 'turning',  label: '蔡森形态',  color: '#E879F9' },   // 粉紫(蔡森多空转折:颈线/满足点/止损)
 ]
 
 // 通道曲线元数据(单一数据源):供 buildOption 画线 + 右侧面板取最新值共用。
@@ -90,6 +91,15 @@ export interface ChartRange {
   color?: string
 }
 
+/** K 线斜线(蔡森收敛三角形上下缘连线)。 */
+export interface ChartLine {
+  id: string
+  name: string
+  color: string
+  kind: 'uptrend' | 'downtrend' | 'horizontal'
+  points: { idx?: number; date?: string; value: number }[]
+}
+
 interface Props {
   rows: KlineRow[]
   levels?: Record<LevelType, PriceLevel[]>
@@ -99,6 +109,8 @@ interface Props {
   seriesDates?: string[]
   /** 默认开启的价位组 */
   defaultLevelTypes?: LevelType[]
+  /** 蔡森斜线(收敛三角形上下缘) */
+  lines?: ChartLine[]
   /** 预留:新闻/暴雷/利好日期标记 */
   markers?: ChartMarker[]
   /** 预留:事件区间高亮 */
@@ -117,6 +129,7 @@ export function AnalysisKChart({
   series,
   seriesDates,
   defaultLevelTypes = ['sr', 'pivot', 'keltner_s'],
+  lines,
   markers,
   ranges,
   onDateClick,
@@ -243,20 +256,22 @@ export function AnalysisKChart({
     // 价位水平线 —— 用 line series(恒定值)画水平线,endLabel 显示标签文字;
     // 与通道曲线一致,标签落在右侧 grid.right 预留带(外侧),不压蜡烛。
     // hoveredKey 非空时:命中线加粗高亮,其它线淡化(opacity 0.15),形成聚焦效果。
+    // 蔡森形态组(turning)是分析结论的关键位(颈线/满足点/止损),用实线 + 更醒目。
     const dimming = hoveredKey != null
     for (const p of priceLines) {
       const k = levelKey(p.type, p.value)
       const hit = hoveredKey === k
-      const opacity = dimming ? (hit ? 1 : 0.12) : 0.7
-      const width = hit ? 2 : 1
+      const isTurning = p.type === 'turning'
+      const opacity = dimming ? (hit ? 1 : 0.12) : (isTurning ? 0.9 : 0.7)
+      const width = hit ? 2.5 : (isTurning ? 1.6 : 1)
       series.push({
         name: p.label, type: 'line', silent: false, animation: false,
         symbol: 'none',
         data: dates.map(() => p.value),
         // 默认 z=1 在蜡烛(z=2)之下; 命中时 zlevel=10 提到独立顶层, 标签不再被遮挡
-        z: 1,
+        z: isTurning ? 2 : 1,
         zlevel: hit ? 10 : 0,
-        lineStyle: { width, color: p.color, type: 'dashed', opacity },
+        lineStyle: { width, color: p.color, type: isTurning ? 'solid' : 'dashed', opacity },
         itemStyle: { color: p.color },
         endLabel: {
           show: true,
@@ -270,6 +285,35 @@ export function AnalysisKChart({
           distance: 6,
         },
       })
+    }
+
+    // 蔡森斜线(收敛三角形上下缘连线)—— 按日期对齐前端 rows,
+    // 只在锚点日期取值,其余为 null + connectNulls,形成穿过锚点的斜线段
+    if (lines && lines.length > 0) {
+      const nRows = dates.length
+      for (const line of lines) {
+        if (!line.points || line.points.length < 2) continue
+        const data: (number | null)[] = new Array(nRows).fill(null)
+        for (const pt of line.points) {
+          let idx = pt.idx ?? -1
+          if (idx < 0 && pt.date != null && dateIndex.has(pt.date)) {
+            idx = dateIndex.get(pt.date)!
+          }
+          if (idx >= 0 && idx < nRows) data[idx] = pt.value
+        }
+        series.push({
+          name: line.name, type: 'line', data, symbol: 'none', silent: false,
+          animation: false, connectNulls: true, z: 2.5,
+          lineStyle: { width: 1.5, color: line.color, type: 'dashed', opacity: 0.95 },
+          itemStyle: { color: line.color },
+          endLabel: {
+            show: true,
+            formatter: () => `${line.name} ${line.points[line.points.length - 1].value.toFixed(2)}`,
+            color: line.color, fontSize: 9, fontFamily: 'JetBrains Mono, monospace',
+            backgroundColor: CT().infoBarBg, padding: [2, 5], borderRadius: 2, distance: 6,
+          },
+        })
+      }
     }
 
     // 带状曲线指标(布林带 / Keltner通道 / ATR波动通道) —— 跟随行情漂移的曲线
@@ -391,7 +435,7 @@ export function AnalysisKChart({
     }
     chartInstRef.current.setOption(buildOption(), true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, levels, series, seriesDates, activeTypes, pivotRank, markers, ranges, height, theme, hoveredKey])
+  }, [rows, levels, series, seriesDates, activeTypes, pivotRank, markers, ranges, lines, height, theme, hoveredKey])
 
   // resize
   useEffect(() => {

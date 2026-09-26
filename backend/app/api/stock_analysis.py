@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.indicators.levels import compute_levels, summarize_levels
+from app.indicators.turning_points import compute_turning_analysis
 from app.services import stock_reports
 from app.services.ndjson_heartbeat import with_heartbeat
 from app.services.stock_analyzer import analyze_stock_stream
@@ -109,12 +110,16 @@ def get_levels(
     symbol: str = Query(..., description="标的代码,如 000001.SZ"),
     days: int = Query(120, ge=30, le=500, description="计算样本天数"),
 ):
-    """计算 11 类关键价位(成交密集区压力支撑 / 枢轴点 / 前高前低 /
-    布林带 / Keltner短中长 / ATR止损 / 缺口 / 斐波那契 / 整数关口)。
+    """计算 11 类关键价位 + 蔡森多空转折点位(成交密集区压力支撑 / 枢轴点 /
+    前高前低 / 布林带 / Keltner短中长 / ATR止损 / 缺口 / 斐波那契 / 整数关口 /
+    蔡森形态颈线·满足点·止损)。
 
     返回 {levels: {sr, pivot, extreme, boll, keltner_s, keltner_m, keltner_l,
-    atr_stop, gap, fib, round}, close, summary, dates, series}。
-    前端按 levels 的 key 渲染开关按钮,逐组显隐 markLine / 曲线。
+    atr_stop, gap, fib, round, turning}, turning: {form, neckline, target, stop,
+    confidence, desc, note, marks, points, summary}, close, summary, dates,
+    series}。
+    前端按 levels 的 key 渲染开关按钮,逐组显隐 markLine / 曲线;
+    turning 组由蔡森·多空转折顾问提供(形态结论 + 关键划线点位)。
     """
     if not symbol:
         raise HTTPException(400, "symbol 不能为空")
@@ -127,17 +132,25 @@ def get_levels(
     if df.is_empty():
         return {"levels": {"sr": [], "pivot": [], "extreme": [],
                            "boll": [], "keltner_s": [], "keltner_m": [], "keltner_l": [],
-                           "atr_stop": [], "gap": [], "fib": [], "round": []},
+                           "atr_stop": [], "gap": [], "fib": [], "round": [],
+                           "turning": []},
+                "turning": {"form": "无数据", "neckline": None, "target": None,
+                            "stop": None, "confidence": "低", "desc": "无 K 线数据",
+                            "note": "", "marks": [], "points": [], "summary": "无 K 线数据"},
                 "close": None, "summary": "无数据", "symbol": symbol,
                 "dates": [], "series": {}}
 
     levels = compute_levels(df)
     close = float(df.tail(1)["close"][0]) if "close" in df.columns else None
+    # 蔡森多空转折顾问:形态结论 + 关键划线点位(并入 levels.turning 组)
+    turning = compute_turning_analysis(df)
+    levels["turning"] = turning["points"]
     # 日期 + 带状曲线序列(供前端画 Keltner/ATR/布林带曲线)
     dates = df["date"].to_list()
     series = _build_series(df)
     return {
         "levels": levels,
+        "turning": turning,
         "close": close,
         "summary": summarize_levels(levels, close),
         "symbol": symbol,
@@ -150,6 +163,38 @@ class AnalyzeRequest(BaseModel):
     """AI 个股分析请求。"""
     symbol: str
     focus: str = ""  # 可选:用户追加的分析关注点
+
+
+@router.get("/turning")
+def get_turning(
+    request: Request,
+    symbol: str = Query(..., description="标的代码,如 000001.SZ"),
+    days: int = Query(120, ge=30, le=500, description="计算样本天数"),
+):
+    """蔡森·多空转折顾问 —— 形态识别 + 关键价位 + 划线标注。
+
+    返回 {form, neckline, target, stop, confidence, desc, note, marks, points,
+    summary, close, symbol}。
+      - form:      W底/破底翻 | M头/双顶 | 箱体震荡 | 趋势
+      - neckline / target / stop: 形态颈线 / 满足点 / 止损
+      - marks:     划线标注 [{yAxis, name, style}](供 K 线图 markLine)
+      - points:    关键价位 [{value, label, type:'turning', side, strength}]
+                   (与 levels.turning 同源,可直接加入点位提醒)
+    """
+    if not symbol:
+        raise HTTPException(400, "symbol 不能为空")
+
+    repo = request.app.state.repo
+    end = date.today()
+    start = end - timedelta(days=days * 2)
+    df = repo.get_daily_asset(repo.resolve_asset_type(symbol), symbol, start, end)
+    if df.is_empty():
+        return {"form": "无数据", "neckline": None, "target": None, "stop": None,
+                "confidence": "低", "desc": "无 K 线数据", "note": "", "marks": [],
+                "points": [], "summary": "无 K 线数据", "close": None, "symbol": symbol}
+    close = float(df.tail(1)["close"][0]) if "close" in df.columns else None
+    turning = compute_turning_analysis(df)
+    return {**turning, "close": close, "symbol": symbol}
 
 
 @router.post("/analyze")

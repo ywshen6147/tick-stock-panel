@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Sparkles, LineChart, History as HistoryIcon, Loader2, ExternalLink, Bell, AlertTriangle } from 'lucide-react'
+import { Sparkles, LineChart, History as HistoryIcon, Loader2, ExternalLink, Bell, AlertTriangle, TrendingUp } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { StockFinancialSearch } from '@/components/financials/StockFinancialSearch'
 import { StockPreviewDialog } from '@/components/StockPreviewDialog'
 import { LastStockChip } from '@/components/LastStockChip'
 import { AnalysisKChart, type PriceLevel, type LevelType } from '@/components/stock-analysis/AnalysisKChart'
+import { CaisenTurningAdvisor } from '@/components/stock-analysis/CaisenTurningAdvisor'
 import { PriceAlertDialog } from '@/components/stock-analysis/PriceAlertDialog'
 import { api } from '@/lib/api'
 import { useLastStock } from '@/lib/useLastStock'
@@ -32,6 +33,8 @@ export function StockAnalysis() {
   const [confirmReport, setConfirmReport] = useState<{ id: string; created_at: string; focus: string } | null>(null)
   const [previewSymbol, setPreviewSymbol] = useState<string | null>(null)
   const [showPriceAlerts, setShowPriceAlerts] = useState(false)
+  // 蔡森·多空转折顾问:按钮触发后展开/滚动到顾问卡片
+  const [advisorOpen, setAdvisorOpen] = useState(false)
   const { last: lastStock, remember: rememberStock } = useLastStock('stock-analysis')
 
   // 进入页面立即加载历史报告(供右侧常驻列表)。store 内部有 historyLoaded 去重, 重复调用安全。
@@ -51,7 +54,20 @@ export function StockAnalysis() {
     setName(nm)
     setConfirmReport(null)
     setShowPriceAlerts(false)
+    setAdvisorOpen(false)
     rememberStock(sym, nm)
+  }
+
+  const handleAdvisor = () => {
+    if (!symbol) {
+      toast('请先选择一只股票,再运行蔡森·多空转折分析', 'error')
+      return
+    }
+    setAdvisorOpen(true)
+    // 等渲染后滚动到顾问卡片
+    setTimeout(() => {
+      document.getElementById('caisen-advisor-card')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }, 80)
   }
 
   const handleAnalyze = async () => {
@@ -81,7 +97,7 @@ export function StockAnalysis() {
     <>
       <PageHeader
         title="个股分析"
-        subtitle="日 K · 关键价位 · AI 四维分析(技术 / 基本面 / 财务 / 消息面)"
+        subtitle="日 K · 关键价位 · 蔡森多空转折 · AI 四维分析(技术 / 基本面 / 财务 / 消息面)"
         right={
           <div className="flex items-center gap-2">
             <LastStockChip stock={lastStock} onSelect={onSelect} />
@@ -115,6 +131,18 @@ export function StockAnalysis() {
                 AI 个股分析
               </button>
               <button
+                onClick={handleAdvisor}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn border text-xs font-medium transition-all ${
+                  advisorOpen
+                    ? 'bg-fuchsia-500/20 border-fuchsia-400/40 text-fuchsia-300'
+                    : 'border-fuchsia-400/25 bg-fuchsia-400/[0.08] text-fuchsia-300 hover:border-fuchsia-400/40 hover:bg-fuchsia-400/[0.12]'
+                }`}
+                title="蔡森《多空转折一手抓》12型态识别:形态结论 / 颈线 / 满足点 / 止损"
+              >
+                <TrendingUp className="h-3.5 w-3.5" />
+                蔡森·多空转折顾问
+              </button>
+              <button
                 onClick={() => setShowPriceAlerts(true)}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn border border-sky-400/25 bg-sky-400/[0.08] text-sky-300 text-xs font-medium hover:border-sky-400/40 hover:bg-sky-400/[0.12] transition-all"
                 title="设置价格点位提醒"
@@ -130,13 +158,31 @@ export function StockAnalysis() {
         <div className="grid grid-cols-[1fr_288px] gap-6 items-start">
           <div className="min-w-0">
             {!symbol ? (
-              <EmptyState
-                icon={LineChart}
-                title="选择一只股票开始分析"
-                hint="搜索代码或名称,查看日 K 与关键价位,并可让 AI 进行技术面 / 基本面 / 财务面 / 消息面四维综合分析。"
-              />
+              <div className="space-y-4">
+                <EmptyState
+                  icon={LineChart}
+                  title="选择一只股票开始分析"
+                  hint="搜索代码或名称,查看日 K 与关键价位,并可让 AI 进行技术面 / 基本面 / 财务面 / 消息面四维综合分析。"
+                />
+                {/* 空状态也展示蔡森顾问入口说明 */}
+                <div className="rounded-card border border-fuchsia-400/25 bg-fuchsia-400/[0.05] overflow-hidden">
+                  <div className="px-4 py-3 border-b border-fuchsia-400/20 flex items-center gap-2">
+                    <TrendingUp className="h-4 w-4 text-fuchsia-400 shrink-0" />
+                    <span className="text-sm font-medium text-foreground">蔡森·多空转折顾问</span>
+                    <span className="text-[10px] text-muted">《多空转折一手抓》12型态</span>
+                  </div>
+                  <div className="px-4 py-3">
+                    <p className="text-[11px] text-secondary leading-relaxed">
+                      选中股票后,点击「蔡森·多空转折顾问」即可自动识别
+                      <span className="text-fuchsia-300"> W底/破底翻 · M头/双顶 · 箱体震荡 · 趋势 </span>
+                      形态,输出 <span className="text-foreground">颈线 / 满足点 / 止损</span>,
+                      并把分析点位一键加入「点位提醒」、划线标注到 K 线图。
+                    </p>
+                  </div>
+                </div>
+              </div>
             ) : (
-              <StockAnalysisBoard symbol={symbol} />
+              <StockAnalysisBoard symbol={symbol} name={name} advisorOpen={advisorOpen} />
             )}
           </div>
           <HistorySidebar />
@@ -173,8 +219,8 @@ export function StockAnalysis() {
   )
 }
 
-// ===== 分析看板:日 K + 关键价位 =====
-function StockAnalysisBoard({ symbol }: { symbol: string }) {
+// ===== 分析看板:日 K + 关键价位 + 蔡森顾问 =====
+function StockAnalysisBoard({ symbol, name, advisorOpen }: { symbol: string; name: string; advisorOpen?: boolean }) {
   const kline = useQuery({
     queryKey: ['kline', symbol, ''],
     queryFn: () => api.klineDaily(symbol, 250),
@@ -209,6 +255,7 @@ function StockAnalysisBoard({ symbol }: { symbol: string }) {
   }
 
   const levels = (levelsQ.data?.levels ?? {}) as Record<LevelType, PriceLevel[]>
+  const turning = levelsQ.data?.turning
 
   // 涨跌色:最后一根 K 线收 vs 前一根收(无前日则按开收判断)
   const last = rows[rows.length - 1]
@@ -217,31 +264,44 @@ function StockAnalysisBoard({ symbol }: { symbol: string }) {
   const isUp = prev ? (last.close >= prev.close) : (last.close >= last.open)
 
   return (
-    <div className="rounded-card border border-border/60 bg-surface/40 overflow-hidden">
-      <div className="px-4 py-3 border-b border-border/40">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <LineChart className="h-4 w-4 text-sky-400 shrink-0" />
-            <span className="text-sm font-medium text-foreground">关键价位分析</span>
-          </div>
-          <div className="flex items-baseline gap-2 shrink-0">
-            <span className="text-[10px] text-muted">{rows.length} 个交易日</span>
-            <span className="text-[10px] text-muted/60">·</span>
-            <span className="text-[10px] text-muted">当前价</span>
-            <span className={`text-base font-mono font-bold ${isUp ? 'text-bull' : 'text-bear'}`}>
-              {curClose?.toFixed(2) ?? '—'}
-            </span>
+    <div className="space-y-4">
+      <div className="rounded-card border border-border/60 bg-surface/40 overflow-hidden">
+        <div className="px-4 py-3 border-b border-border/40">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <LineChart className="h-4 w-4 text-sky-400 shrink-0" />
+              <span className="text-sm font-medium text-foreground">关键价位分析</span>
+            </div>
+            <div className="flex items-baseline gap-2 shrink-0">
+              <span className="text-[10px] text-muted">{rows.length} 个交易日</span>
+              <span className="text-[10px] text-muted/60">·</span>
+              <span className="text-[10px] text-muted">当前价</span>
+              <span className={`text-base font-mono font-bold ${isUp ? 'text-bull' : 'text-bear'}`}>
+                {curClose?.toFixed(2) ?? '—'}
+              </span>
+            </div>
           </div>
         </div>
+        <div className="p-3">
+          <AnalysisKChart
+            rows={rows}
+            levels={levels}
+            series={levelsQ.data?.series}
+            seriesDates={levelsQ.data?.dates}
+            lines={turning?.lines}
+            defaultLevelTypes={['sr', 'pivot', 'keltner_s', 'turning']}
+            height={480}
+          />
+        </div>
       </div>
-      <div className="p-3">
-        <AnalysisKChart
-          rows={rows}
-          levels={levels}
-          series={levelsQ.data?.series}
-          seriesDates={levelsQ.data?.dates}
-          defaultLevelTypes={['sr', 'pivot', 'keltner_s']}
-          height={480}
+
+      {/* 蔡森·多空转折顾问(形态结论 + 点位 + 划线;与 AI 个股分析并存) */}
+      <div id="caisen-advisor-card" className={`transition-all ${advisorOpen ? 'ring-2 ring-fuchsia-400/40 rounded-card' : ''}`}>
+        <CaisenTurningAdvisor
+          symbol={symbol}
+          name={name}
+          turning={turning}
+          loading={levelsQ.isLoading}
         />
       </div>
     </div>
