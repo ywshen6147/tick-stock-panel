@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import date, timedelta
+from datetime import timedelta
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from app.indicators.levels import compute_levels, summarize_levels
 from app.indicators.turning_points import compute_turning_analysis
+from app.market_time import cn_today
 from app.services import stock_reports
 from app.services.ndjson_heartbeat import with_heartbeat
 from app.services.stock_analyzer import analyze_stock_stream
@@ -125,7 +126,7 @@ def get_levels(
         raise HTTPException(400, "symbol 不能为空")
 
     repo = request.app.state.repo
-    end = date.today()
+    end = cn_today()
     start = end - timedelta(days=days * 2)
     # 按资产类型分流: ETF/指数走独立 enriched 存储, 股票保持原路径
     df = repo.get_daily_asset(repo.resolve_asset_type(symbol), symbol, start, end)

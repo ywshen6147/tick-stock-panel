@@ -39,6 +39,7 @@ import {
   Gauge,
   Sparkles,
   Layers2,
+  Wallet,
   Layers3,
   Zap,
   Landmark,
@@ -98,6 +99,7 @@ const nav = [
   { to: '/regime', label: '市场环境', icon: Gauge },
   { to: '/abnormal', label: '异动监控', icon: Siren },
   { to: '/lots',       label: '持仓提醒', icon: Layers2 },
+  { to: '/paper',      label: '模拟盘',   icon: Wallet },
   { to: '/signals',    label: '信号库',   icon: Zap },
   { to: '/review',      label: '复盘',   icon: BookOpenCheck },
   { to: '/indices', label: '指数', icon: BarChart3 },
@@ -329,7 +331,7 @@ function AIConfigBadge({ configured, model }: { configured?: boolean; model?: st
       <span className="pointer-events-none absolute inset-y-1.5 left-0 w-[2px] rounded-full bg-purple-400/50 transition-colors group-hover:bg-purple-400" />
       <Sparkles className="h-3.5 w-3.5 shrink-0 text-muted group-hover:text-purple-400 transition-colors" />
       {configured ? (
-        <span className="truncate text-[11px] font-medium text-secondary group-hover:text-foreground transition-colors">
+        <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-secondary group-hover:text-foreground transition-colors">
           {model || '已接入模型'}
         </span>
       ) : (
