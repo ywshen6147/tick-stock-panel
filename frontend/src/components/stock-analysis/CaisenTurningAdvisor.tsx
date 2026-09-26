@@ -331,6 +331,19 @@ export function CaisenTurningAdvisor({ symbol, name, turning, loading }: Props) 
                 const Icon = PATTERN_ICON[p.key] ?? Minus
                 const dirCls = p.direction === 'bull' ? 'text-bull'
                   : p.direction === 'bear' ? 'text-bear' : 'text-muted'
+                // v3.1 三态徽章: 有效 / 已完成 / 已失效
+                const statusMeta = p.status === 'done'
+                  ? { label: '已完成', cls: 'text-amber-300 border-amber-400/40 bg-amber-400/10' }
+                  : p.status === 'invalid'
+                    ? { label: '已失效', cls: 'text-bear border-bear/40 bg-bear/10' }
+                    : null
+                const detailLines: string[] = []
+                if (p.break_position) detailLines.push(p.break_position)
+                if (p.key === 'break_below_reverse') {
+                  if (p.time_wave_status) detailLines.push(`时间波:${p.time_wave_status}`)
+                  if (p.vol_note) detailLines.push(p.vol_note)
+                  if (p.target_basis) detailLines.push(p.target_basis)
+                }
                 return (
                   <div key={i} className="px-3 py-2">
                     <div className="flex items-center gap-2">
@@ -345,8 +358,20 @@ export function CaisenTurningAdvisor({ symbol, name, turning, loading }: Props) 
                       }`}>
                         {p.confirmed ? '✓ 确认' : '观察中'}
                       </span>
+                      {statusMeta && (
+                        <span className={`px-1.5 py-0.5 rounded border text-[9px] shrink-0 ${statusMeta.cls}`}>
+                          {statusMeta.label}
+                        </span>
+                      )}
                     </div>
                     <p className="mt-0.5 text-[10px] text-secondary leading-relaxed">{p.desc}</p>
+                    {detailLines.length > 0 && (
+                      <div className="mt-1 space-y-0.5">
+                        {detailLines.map((line, j) => (
+                          <p key={j} className="text-[9px] text-muted leading-relaxed">{line}</p>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )
               })}

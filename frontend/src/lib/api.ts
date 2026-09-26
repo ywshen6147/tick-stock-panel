@@ -249,10 +249,33 @@ export interface TurningPattern {
   confirmed: boolean
   neckline?: number | null
   target?: number | null
+  /** v3.1 第二波满足(等幅/翻箱第二目标) */
+  target2?: number | null
   top?: number | null
   bottom?: number | null
   desc: string
   marks: TurningMark[]
+  /** v3.1 三态: 有效 / 已完成(已达第一满足) / 已失效(破止损) */
+  status?: 'valid' | 'done' | 'invalid'
+  status_label?: string
+  /** 破底翻 v3.1 专用 */
+  target_basis?: string
+  box_height?: number | null
+  break_price?: number | null
+  add_level?: number | null
+  stop_loss?: number | null
+  stop_structure?: number | null
+  stop_basis?: string
+  vol_confirm?: boolean | null
+  vol_note?: string
+  signal_age?: number
+  neckline_hold?: boolean
+  weak_note?: string
+  stale_note?: string
+  force_invalid?: string
+  time_wave?: TurningTimeWave | null
+  time_wave_status?: string
+  time_wave_note?: string
   /** 收敛三角形专属:上下缘斜线锚点/斜率/动态价/尖点 */
   upper_line?: { idx?: number; date?: string; value: number }[]
   lower_line?: { idx?: number; date?: string; value: number }[]
@@ -267,6 +290,28 @@ export interface TurningPattern {
   dyn_target?: number | null
   /** 静态口径满足位(突破颈线 + 全高,远目标) */
   static_target?: number | null
+  /** v3.1 位置过滤: 1/2~3/4 行程处突破才有效 */
+  break_position?: string
+}
+
+/** 蔡森·多空转折顾问 —— v3.1 时间波(前波下跌K棒数 × 0.618/1.0/1.618 推变盘窗口)。 */
+export interface TurningTimeWaveWindow {
+  ratio: number
+  bars: number
+  date: string
+  idx: number
+  reached: boolean
+  remain: number
+}
+
+export interface TurningTimeWave {
+  down_bars: number
+  down_from: string
+  down_to: string
+  base_date: string
+  elapsed: number
+  windows: TurningTimeWaveWindow[]
+  note: string
 }
 
 /** 蔡森·多空转折顾问 —— K 线斜线(收敛三角形上下缘连线)。 */

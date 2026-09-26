@@ -186,7 +186,7 @@ def get_turning(
         raise HTTPException(400, "symbol 不能为空")
 
     repo = request.app.state.repo
-    end = date.today()
+    end = cn_today()
     start = end - timedelta(days=days * 2)
     df = repo.get_daily_asset(repo.resolve_asset_type(symbol), symbol, start, end)
     if df.is_empty():

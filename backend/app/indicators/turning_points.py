@@ -38,6 +38,15 @@ logger = logging.getLogger(__name__)
 # 输出组 key(与 LEVEL_TYPES 对齐,前端按 key 渲染开关)
 TURNING_TYPE = "turning"
 
+# ---- 蔡森体系 v3.1 参数(2026-09-24 原书对齐,与 caisen-patterns skill 同源) ----
+# 破底翻翻箱法: 第一目标 = 颈线C + (C − 破底低B); 第二目标 = 颈线C + 2×(C − B)(强量能才看)
+_TARGET_MULT = 2.0          # 第二目标倍数(两倍翻箱)
+_VOL_CONFIRM_RATIO = 1.5    # 放量定义: 突破量 ≥ 前N日均量 × 1.5
+_VOL_LOOKBACK = 5           # 放量对比基准: 前5日均量
+_BREAK_LOW_BUF = 0.015      # 止损缓冲: 破底低点B下方 1.5%
+# 时间波(陈文图/台系): 前波下跌K棒数 × {0.618, 1.0, 1.618} 推变盘窗口
+_TIMEWAVE_RATIOS = (0.618, 1.0, 1.618)
+
 
 # ================================================================
 # 工具
@@ -103,6 +112,136 @@ def _round(v: float | None, n: int = 2) -> float | None:
 
 
 # ================================================================
+# 蔡森体系 v3.1 工具(2026-09-24 原书对齐)
+# ================================================================
+
+def _vol_confirm(
+    vols: list[float], idx: int,
+    ratio: float = _VOL_CONFIRM_RATIO, lookback: int = _VOL_LOOKBACK,
+) -> tuple[bool | None, str]:
+    """放量突破验证: 突破那根的量能 ≥ 前 lookback 日均量 × ratio。
+
+    返回 (状态, 说明): True=放量确认 / False=无量突破 / None=数据不足无法验证。
+    """
+    if idx < lookback or idx >= len(vols) or len(vols) != len(vols):
+        return None, "量能数据不足,无法验证"
+    prev = vols[idx - lookback:idx]
+    cur = vols[idx]
+    if not prev or max(prev) <= 0 or not _ok(cur) or cur <= 0:
+        return None, "无成交量数据,无法验证"
+    ma = sum(prev) / len(prev)
+    r = cur / ma
+    txt = f"突破量={cur:,.0f}, 前{lookback}日均量={ma:,.0f}, 倍数={r:.2f}x"
+    if r >= ratio:
+        return True, txt + f" ≥ {ratio}x → 放量确认"
+    return False, txt + f" < {ratio}x → 无量突破"
+
+
+def _time_wave(
+    highs: list[float], lows: list[float], dates: list | None,
+    high_idx: int, low_idx: int, base_idx: int | None = None,
+    ratios: tuple = _TIMEWAVE_RATIOS,
+) -> dict | None:
+    """时间波(陈文图/台系): 数前一波下跌波段的K棒数, 用 0.618/1.0/1.618 倍推下一波变盘窗口。
+
+    high_idx: 前波起跌高点索引; low_idx: 破底/转折低点索引(默认起算点)。
+    base_idx: 可选二次起算点(如突破确认那根); 默认从低点起算。
+    返回时间目标(窗口K棒数+对应日期)与当前进度; 概率性区间, 非精准某一天。
+    """
+    n = len(highs)
+    if low_idx <= high_idx or high_idx < 0 or low_idx >= n:
+        return None
+    n_down = low_idx - high_idx + 1                  # 前波下跌K棒数(含两端)
+    base = base_idx if (base_idx is not None and low_idx <= base_idx < n) else low_idx
+    elapsed = n - 1 - base                           # 起算点以来已走K棒数
+    wins: list[dict] = []
+    for r in ratios:
+        k = max(1, int(round(n_down * r)))
+        idx = base + k
+        d = str(dates[idx]) if dates and 0 <= idx < len(dates) else None
+        wins.append({
+            "ratio": r, "bars": k,
+            "date": d if idx < n else f"(需再走{idx - (n - 1)}根)",
+            "idx": idx, "reached": idx <= n - 1,
+            "remain": max(0, idx - (n - 1)),
+        })
+    return {
+        "down_bars": n_down,
+        "down_from": (f"{dates[high_idx]}@{round(highs[high_idx], 2)}"
+                      if dates and 0 <= high_idx < len(dates)
+                      else f"idx{high_idx}@{round(highs[high_idx], 2)}"),
+        "down_to": (f"{dates[low_idx]}@{round(lows[low_idx], 2)}"
+                    if dates and 0 <= low_idx < len(dates)
+                    else f"idx{low_idx}@{round(lows[low_idx], 2)}"),
+        "base_date": (str(dates[base]) if dates and 0 <= base < len(dates) else f"idx{base}"),
+        "elapsed": elapsed,
+        "windows": wins,
+        "note": "时间波为概率性时间窗口(区间非某日), 须搭配价格形态使用",
+    }
+
+
+def _timewave_resonance(
+    price: float, tw: dict | None, target: float | None, target2: float | None = None,
+) -> tuple[str, str]:
+    """时价共振判定: 时间窗口到 + 价格抵达目标 = 时空共振(优先获利了结)。
+
+    返回 (状态标签, 共振说明)。
+    """
+    if not tw:
+        return "", ""
+    elapsed = tw["elapsed"]
+    near = None
+    for w in tw["windows"]:
+        if abs(elapsed - w["bars"]) <= max(1, int(round(w["bars"] * 0.1))):
+            near = w
+            break
+    late = all(elapsed > w["bars"] + max(1, int(round(w["bars"] * 0.1))) for w in tw["windows"])
+    price_hit = bool(target) and price >= target
+    price_hit2 = bool(target2) and price >= target2
+    tname = f"{near['ratio']}倍窗口({near['bars']}根)" if near else ""
+    if price_hit and near:
+        return "时空共振", (f"⚠️ 时间到({elapsed}根≈{tname}) + 价格已达目标({target}) → "
+                            f"优先获利了结/减仓")
+    if price_hit:
+        return "价到时应未到", (f"价格已到目标({target})但时间未到窗口(已走{elapsed}根, "
+                                f"下一窗口{tw['windows'][1]['bars']}根) → 易横盘震荡, 不一定马上反转")
+    if near:
+        return "时间到价未到", (f"时间窗口已到({elapsed}根≈{tname})但价格未达目标({target}) → "
+                                f"行情偏强, 大概率继续延伸")
+    if late:
+        return "超时", (f"已走{elapsed}根, 超过最大窗口{tw['windows'][-1]['bars']}根仍未见共振 → "
+                        f"时间波参考性下降, 以价格结构为准")
+    return "未到窗口", (f"已走{elapsed}根, 距最近窗口({tw['windows'][0]['bars']}根)尚有"
+                        f"{tw['windows'][0]['bars'] - elapsed}根")
+
+
+def _pattern_status(
+    price: float, direction: str, target: float | None, stop: float | None,
+    break_idx: int, highs: list[float], lows: list[float],
+    force_invalid: str | None = None,
+) -> tuple[str, str]:
+    """三态判定(原书: 到第一满足多会整理做了结; 破止损即失效)。
+
+    返回 (group, label): group ∈ {'valid','done','invalid'}。
+    """
+    if force_invalid:
+        return "invalid", f"已失效({force_invalid})"
+    sig = "多头买进" if direction == "bull" else "空单进场"
+    b = break_idx if (isinstance(break_idx, int) and 0 <= break_idx < len(highs)) else len(highs) - 1
+    if sig == "多头买进":
+        if stop and price < stop:
+            return "invalid", "已失效(跌破止损)"
+        if target and any(h >= target for h in highs[b:]):
+            return "done", "已完成(已达第一满足)"
+    else:
+        if stop and price > stop:
+            return "invalid", "已失效(涨破止损)"
+        if target and any(l <= target for l in lows[b:]):
+            return "done", "已完成(已达第一满足)"
+    return "valid", "有效"
+
+
+# ================================================================
 # 摆动点提取
 # ================================================================
 
@@ -145,14 +284,21 @@ def _merge(points: list[tuple[int, float]], tol: float = 0.03, gap: int = 10) ->
 
 def _detect_break_below_reverse(
     highs: list[float], lows: list[float], closes: list[float],
-    price: float, n: int,
+    price: float, n: int, vols: list[float] | None = None,
+    dates: list | None = None,
 ) -> dict | None:
-    """破底翻(招2/3):前低 L1 → 破底 L2(L2 < L1) → 快速收复站上颈线。
+    """破底翻(招2/3, v3.1 原书对齐):前低 L1 → 破底 L2(L2 < L1) → 快速收复站上颈线。
 
     关键:破底低点 L2 是**历史真实底部**(最近 200 根内最低摆动低点),
     而非当前回踩低点——破底翻确认后的回踩(未破 L2)正是健康结构。
-    颈线 = L1 与 L2 之间的反弹高点;满足点 = 颈线 + (颈线 - L2);
-    止损 = L2 × 0.985。确认:现价 > 颈线。
+    颈线 = L1 与 L2 之间的反弹高点。
+
+    v3.1 (2026-09-24) 更新:
+      - 价格目标改用**翻箱法**: 第一 = C+(C−B)、第二 = C+2×(C−B)(强量能才看)
+      - **放量前提**: 突破颈线必须放量(≥前5日均量×1.5); 无量突破 → 形态失效, target 置空
+      - **时间波**: 数前波下跌(颈线→破底B)K棒数, 0.618/1.0/1.618 推变盘窗口 → 时价共振
+      - 止损 = L2 × (1 − 1.5%)缓冲, 标注与 5~7% 纪律带关系
+    确认:现价 > 颈线(或已收盘站上颈线)。
     """
     if n < 40:
         return None
@@ -186,22 +332,95 @@ def _detect_break_below_reverse(
     # 破底翻必须:颈线明显高于破底低点(>=3%)
     if (neck - l2[1]) / neck < 0.03:
         return None
-    target = neck + (neck - l2[1])
+
+    # ---- v3.1 翻箱法价格目标 ----
+    height = neck - l2[1]                          # 翻箱高度 = 颈线 − 破底最低点
+    t1 = neck + height                             # 第一目标(翻箱, 最常用)
+    t2 = neck + _TARGET_MULT * height              # 第二目标(两倍翻箱, 需强量能)
+
+    # 突破确认: L2 之后第一根收盘站上颈线 → 放量前提(无量突破 → 失效)
+    brk_idx = next((i for i in range(l2[0] + 1, n) if closes[i] > neck), None)
     confirmed = price > neck
-    return {
+    vol_ok: bool | None = None
+    vol_txt = ""
+    if brk_idx is not None and vols and len(vols) == n:
+        vol_ok, vol_txt = _vol_confirm(vols, brk_idx)
+
+    # 放量前提: 无量突破 → 形态失效, 不看目标
+    force_invalid: str | None = None
+    if confirmed and brk_idx is not None and vol_ok is False:
+        force_invalid = "突破颈线无量(破底翻失效)"
+        t1 = t2 = None
+    elif brk_idx is None:
+        # 尚未突破: 保留结构但标注未确认, 不给目标(避免拿未突破的价格当锚)
+        force_invalid = None
+        t1 = t2 = None
+
+    # v3.1 止损: 破底低点B下方 1.5% 缓冲(标注与 5~7% 纪律带关系)
+    stop_b = l2[1] * (1 - _BREAK_LOW_BUF)
+    stop_basis = f"破底低点B({l2[1]:.2f})下方{_BREAK_LOW_BUF:.1%}缓冲"
+    if brk_idx is not None and _ok(closes[brk_idx]):
+        dist = (closes[brk_idx] - stop_b) / closes[brk_idx]
+        stop_basis += (f"; 距突破价{dist:.1%}" +
+                       ("超出5~7%纪律带→应减仓位或按纪律提前离场" if dist > 0.07 else "在5~7%纪律带内"))
+
+    # v3.1 时间波: 前波下跌 = 颈线高点 → 破底低点B, 从B起算
+    tw = _time_wave(highs, lows, dates, neck_idx, l2[0])
+    res_label, res_txt = _timewave_resonance(price, tw, t1, t2)
+
+    # 诚实性字段: 突破后已走根数 / 现价是否仍守颈线
+    signal_age = (n - 1 - brk_idx) if brk_idx is not None else 0
+    neckline_hold = price >= neck
+
+    desc_parts = [f"破底翻{'确认' if confirmed else '确认期'}:前低 {l1[1]:.2f} → 破底 {l2[1]:.2f} → "
+                  f"站上颈线 {neck:.2f}"]
+    if t1 is not None:
+        desc_parts.append(f"翻箱第一目标 {t1:.2f}(第二 {t2:.2f})")
+    if force_invalid:
+        desc_parts.append("无量突破→失效")
+    desc = "; ".join(desc_parts)
+
+    out = {
         "key": "break_below_reverse", "name": "破底翻", "direction": "bull",
-        "confirmed": confirmed, "neckline": neck, "bottom": l2[1], "target": target,
-        "desc": (
-            f"破底翻{'确认' if confirmed else '确认期'}:前低 {l1[1]:.2f} → 破底 {l2[1]:.2f} → "
-            f"站上颈线 {neck:.2f},满足点 {target:.2f}"
-        ),
+        "confirmed": confirmed, "neckline": neck, "bottom": l2[1],
+        "target": t1, "target2": t2,
+        "target_basis": "第一=C+(C−B) 翻箱; 第二=C+2×(C−B) 两倍翻箱(需强量能)",
+        "box_height": round(height, 2),
+        "break_price": round(closes[brk_idx], 2) if (brk_idx is not None and _ok(closes[brk_idx])) else None,
+        "add_level": round(neck, 2),
+        "stop_loss": round(stop_b, 2), "stop_structure": round(stop_b, 2), "stop_basis": stop_basis,
+        "vol_confirm": vol_ok, "vol_note": vol_txt,
+        "signal_age": signal_age, "neckline_hold": neckline_hold,
+        "break_idx": brk_idx if brk_idx is not None else n - 1,
+        "desc": desc,
         "marks": [
             {"yAxis": neck, "name": f"破底翻颈线 {neck:.2f}", "style": "orange"},
-            {"yAxis": target, "name": f"满足点 {target:.2f}", "style": "purple"},
+            {"yAxis": t1, "name": f"满足点 {t1:.2f}", "style": "purple"} if t1 else None,
             {"yAxis": l2[1], "name": f"破底低 {l2[1]:.2f}", "style": "green"},
             {"yAxis": l1[1], "name": f"前低 {l1[1]:.2f}", "style": "green"},
         ],
     }
+    if not neckline_hold:
+        out["weak_note"] = (f"现价 {price:.2f} 已回落至颈线C({neck:.2f})下方, "
+                            f"突破回测加深 → 信号转弱(止损仍以破底低点B为准)")
+    if tw:
+        out["time_wave"] = tw
+        out["time_wave_status"] = res_label
+        out["time_wave_note"] = res_txt
+    if brk_idx is not None and tw:
+        max_win = tw["windows"][-1]["bars"]
+        if signal_age > max_win:
+            out["stale_note"] = (f"突破已过 {signal_age} 根, 超过最长时间波窗口, "
+                                 f"信号新鲜度下降, 优先看更近期的形态")
+    if force_invalid:
+        out["force_invalid"] = force_invalid
+        out["target"] = None
+        out["target2"] = None
+        out["confidence"] = 0.40
+    else:
+        out["confidence"] = 0.75
+    out["marks"] = [m for m in out["marks"] if m is not None]
+    return out
 
 
 def _detect_double_bottom(
@@ -512,6 +731,22 @@ def _detect_triangle(highs: list[float], lows: list[float], closes: list[float],
     height = dyn_up - dyn_lo
     price = closes[-1]
     broke_upper = price > dyn_up
+    # v3.1 位置过滤(原书): 有效突破须在三角形 1/2~3/4 行程处;
+    # 行程比 = (当前/突破根 − 起点) / (收敛尖点 − 起点); 尾端(>0.85)突破易失败反转。
+    tri_start = min(up_pts[0][0], lo_pts[0][0])
+    apex_i = float(apex_idx) if apex_idx is not None else None
+    break_position: str | None = None
+    if apex_i is not None and apex_i > tri_start + 2:
+        ratio = (last_idx - tri_start) / (apex_i - tri_start)
+        if broke_upper:
+            if ratio < 0.30:
+                break_position = f"行程{ratio * 100:.0f}%(不足1/2行程,形态未成熟,突破不可信)"
+            elif ratio > 0.85:
+                break_position = f"行程{ratio * 100:.0f}%(尾端突破易失败反转)"
+            else:
+                break_position = f"行程{ratio * 100:.0f}%(1/2~3/4有效区)"
+        else:
+            break_position = f"行程{ratio * 100:.0f}%(未突破)"
     # 双口径满足位(对齐 EvoFlow 报告的「动态 vs 静态」说明):
     #   动态口径 = 突破位(现价/动态上缘) + 当日三角形高度 → 突破初期第一目标(近)
     #   静态口径 = 突破颈线 + 全高(最后一个高点到下缘最低点的垂直距离) → 站上颈线后的主升目标(远)
@@ -522,7 +757,7 @@ def _detect_triangle(highs: list[float], lows: list[float], closes: list[float],
 
     return {
         "key": "triangle", "name": "收敛三角形", "direction": "neutral",
-        "confirmed": broke_upper,  # 突破上缘视为向上表态(未确认,3日看)
+        "confirmed": broke_upper,  # 突破上缘视为向上表态(未确认,3日看; 且须过位置过滤)
         "neckline": round(dyn_up, 2), "bottom": round(dyn_lo, 2),
         "target": None,
         "upper_line": upper_line, "lower_line": lower_line,
@@ -533,12 +768,14 @@ def _detect_triangle(highs: list[float], lows: list[float], closes: list[float],
         "height": round(height, 2),
         "dyn_target": round(dyn_target, 2),
         "static_target": round(static_target, 2) if static_target else None,
+        "break_position": break_position,
         "desc": (
             f"收敛三角形:上缘高连高 {h_use[0][1]:.2f}→{h_use[-1][1]:.2f}(斜率{up_slope:+.4f}/天),"
             f"下缘低连低 {l_use[0][1]:.2f}→{l_use[-1][1]:.2f}(斜率{lo_slope:+.4f}/天),"
             f"当日动态上缘 {dyn_up:.2f}{'(已突破)' if broke_upper else '(未破)'},"
             f"动态满足 {dyn_target:.2f} / 静态满足 {static_target:.2f},"
             f"收敛尖点约 idx{apex_idx:.0f}/价 {apex_val:.2f}"
+            + (f"; {break_position}" if break_position else "")
         ),
         "marks": [
             {"yAxis": round(dyn_up, 2), "name": f"上缘 {dyn_up:.2f}", "style": "orange"},
@@ -661,17 +898,22 @@ def compute_turning_analysis(df: pl.DataFrame) -> dict:
 
         # ---- 多形态同时识别(长窗口) ----
         patterns: list[dict] = []
-        p_break_reverse = _detect_break_below_reverse(highs, lows, closes, price, n)
+        dates_arr = df["date"].to_list() if "date" in df.columns else None
+        p_break_reverse = _detect_break_below_reverse(highs, lows, closes, price, n, vols, dates_arr)
         p_double_bottom = _detect_double_bottom(highs, lows, closes, price, n)
         p_fake_breakout = _detect_fake_breakout(highs, lows, closes, vols, price, n)
         p_double_top = _detect_double_top(highs, lows, closes, price, n)
         p_box = _detect_box(highs, lows, price)
-        dates_arr = df["date"].to_list() if "date" in df.columns else None
         p_triangle = _detect_triangle(highs, lows, closes, n, dates_arr)
         p_trend = _detect_trend(ma20, ma60, price)
 
         for p in (p_break_reverse, p_double_bottom, p_fake_breakout, p_double_top, p_box, p_triangle, p_trend):
             if p:
+                # v3.1 三态判定: 有效 / 已完成(已达第一满足) / 已失效(破止损)
+                p["status"], p["status_label"] = _pattern_status(
+                    price, p["direction"], p.get("target"), p.get("stop_loss") or p.get("stop"),
+                    p.get("break_idx", n - 1), highs, lows, p.get("force_invalid"),
+                )
                 patterns.append(p)
 
         # ---- 波段结构 ----
@@ -812,6 +1054,8 @@ def _collect_points(
         if key in ("double_bottom", "break_below_reverse"):
             add(p.get("neckline"), f"{p['name']}颈线", "strong")
             add(p.get("target"), f"{p['name']}满足点", "medium")
+            add(p.get("target2"), f"{p['name']}第二满足", "medium")
+            add(p.get("add_level"), f"{p['name']}加码位", "medium")
             add(p.get("bottom"), f"{p['name']}底部", "medium")
         elif key in ("double_top", "fake_breakout"):
             add(p.get("neckline"), f"{p['name']}颈线", "strong")
@@ -1019,6 +1263,12 @@ def _build_desc(patterns: list[dict], waves: dict, price: float, verdict: str) -
             parts.append(f"第一波已走完,回踩确认中,中期目标 {waves['second_wave_target']:.2f}")
         if waves.get("pullback_low"):
             parts.append(f"回踩低点 {waves['pullback_low']:.2f}")
+    # v3.1: 破底翻时间波 / 放量状态
+    bbr = next((p for p in patterns if p["key"] == "break_below_reverse"), None)
+    if bbr and bbr.get("time_wave_status"):
+        parts.append(f"时间波:{bbr['time_wave_status']}")
+    if bbr and bbr.get("vol_note"):
+        parts.append(bbr["vol_note"])
     parts.append(f"现价 {price:.2f}")
     return ";".join(parts)
 
@@ -1040,6 +1290,16 @@ def _build_summary(
         parts.append("已确认:" + "/".join(confirmed[:3]))
     if waves.get("available") and waves.get("second_wave_target"):
         parts.append(f"第二波目标 {waves['second_wave_target']:.2f}")
+    # v3.1: 三态摘要 + 破底翻时间波
+    done = [p["name"] for p in patterns if p.get("status") == "done"]
+    invalid = [p["name"] for p in patterns if p.get("status") == "invalid"]
+    if done:
+        parts.append("已完成:" + "/".join(done[:2]))
+    if invalid:
+        parts.append("已失效:" + "/".join(invalid[:2]))
+    bbr = next((p for p in patterns if p["key"] == "break_below_reverse"), None)
+    if bbr and bbr.get("time_wave_status"):
+        parts.append(f"时间波 {bbr['time_wave_status']}")
     parts.append(f"现价 {price:.2f}")
     return " · ".join(parts)
 
