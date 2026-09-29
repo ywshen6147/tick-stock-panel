@@ -1,7 +1,9 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { X } from 'lucide-react'
-import { type KlineRow, type FinancialMetricRecord } from '@/lib/api'
+import { type KlineRow, type FinancialMetricRecord, api } from '@/lib/api'
+import { QK } from '@/lib/queryKeys'
+import { buildAllMonitorPriceLines } from '@/lib/price-alerts'
 import { klineDailyQueryOptions, klineMinuteQueryOptions, klineMinuteRangeQueryOptions, DEFAULT_INTRADAY_DAYS } from '@/lib/kline'
 import { StockInfoBar } from '@/components/StockInfoBar'
 import { StockDailyKChart, getDefaultRange, toOHLC } from '@/components/StockDailyKChart'
@@ -105,6 +107,30 @@ export function StockPanel({
     [fields],
   )
   const financials = useFinancialMetrics(hasFinanceField && hasFinancialCap ? symbol : undefined)
+
+  // 监控点位: 读取该 symbol 的「个股价格监控规则」, 把 close 阈值画到日K/分时图上。
+  // 与 StockPreviewDialog 共用 QK.monitorRules 缓存 (只发一次请求)。
+  const monitorRules = useQuery({
+    queryKey: QK.monitorRules,
+    queryFn: api.monitorRulesList,
+    staleTime: 30_000,
+  })
+  const monitorPriceLines = useMemo(
+    () => (symbol ? buildAllMonitorPriceLines(monitorRules.data?.rules ?? [], symbol) : []),
+    [monitorRules.data?.rules, symbol],
+  )
+  // 合并外部传入的价格线 + 监控点位 (外部优先, 监控点位去重后追加)
+  const allPriceLines = useMemo(() => {
+    const merged = [...(priceLines ?? [])]
+    const seen = new Set(merged.map(l => l.value.toFixed(2)))
+    for (const l of monitorPriceLines) {
+      const k = l.value.toFixed(2)
+      if (seen.has(k)) continue
+      seen.add(k)
+      merged.push(l)
+    }
+    return merged
+  }, [priceLines, monitorPriceLines])
 
   const defaultDateRange = getDefaultRange()
   const rangeStart = externalDateRange?.start ?? defaultDateRange.start
@@ -213,7 +239,7 @@ export function StockPanel({
           dateRange={dateRange}
           markers={markers}
           ranges={ranges}
-          priceLines={priceLines}
+          priceLines={allPriceLines}
           showLimitMarkers={showLimitMarkers}
           showMarkerToggle={showMarkerToggle}
           linkedPrice={linkedPrice}
@@ -243,7 +269,7 @@ export function StockPanel({
               onPriceHover={setLinkedPrice}
               onPriceDoubleClick={onPriceDoubleClick}
               currentPrice={rows[rows.length - 1]?.close}
-              priceLines={priceLines}
+              priceLines={allPriceLines}
               refetchIntervalMs={refetchIntervalMs}
             />
           </div>

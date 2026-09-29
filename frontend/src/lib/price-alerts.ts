@@ -63,3 +63,34 @@ export function buildMonitorPriceLines(rules: MonitorRule[], symbol: string): Mo
     }]
   })
 }
+
+/**
+ * 完整版监控点位提取: 兼容多条件规则与全部 close 算子 (>=/<=/>/<)。
+ *
+ * 与 parsePointPriceAlert 不同, 这里只要规则是「个股价格规则」(scope=symbols、
+ * 命中该 symbol、type=price) 且含 close 价格条件, 就把 close 阈值作为点位输出 —
+ * 覆盖「放量站稳 X + 量比」这类多条件规则, 让 K 线/分时图能画出全部监控价位。
+ * 同价位多规则去重; 颜色: 突破位(>=/>)=红, 跌破位(<=/<)=绿。
+ */
+export function buildAllMonitorPriceLines(rules: MonitorRule[], symbol: string): MonitorPriceLine[] {
+  const seen = new Set<string>()
+  const out: MonitorPriceLine[] = []
+  for (const rule of rules) {
+    if (!rule.enabled) continue
+    if (rule.type !== 'price' || rule.scope !== 'symbols') continue
+    if (!rule.symbols.includes(symbol)) continue
+    const cond = (rule.conditions ?? []).find(c => c.field === 'close' && typeof c.value === 'number')
+    if (!cond || !Number.isFinite(cond.value as number) || (cond.value as number) <= 0) continue
+    const target = cond.value as number
+    const key = target.toFixed(2)
+    if (seen.has(key)) continue
+    seen.add(key)
+    const isUp = cond.op === '>=' || cond.op === '>'
+    out.push({
+      value: target,
+      label: `${isUp ? '上穿' : '下穿'} ${target.toFixed(2)}`,
+      color: isUp ? '#C74040' : '#2D9B65',
+    })
+  }
+  return out
+}
