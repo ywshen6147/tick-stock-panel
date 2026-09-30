@@ -379,8 +379,12 @@ async function opRealtime(sdk, job) {
       open: num(it.open),
       high: num(it.high),
       low: num(it.low),
-      volume: num(it.volume),
-      amount: num(it.amount),
+      // 新浪 getHQNodeData: volume=股, amount=元。内部契约统一为 volume=手、amount=元,
+      // 且 Python 侧 get_realtime 会把 amount 视为「万元」×10000。这里把新浪原始值
+      // 折成契约口径: volume ÷100(股→手), amount ÷10000(元→万元), 由 Python 侧 ×10000 还原。
+      // 未归一化会把换手率/量比/成交额算错, 实时写盘的「盘中快照」日K分区也会被污染。
+      volume: num(it.volume) != null ? num(it.volume) / 100 : null,
+      amount: num(it.amount) != null ? num(it.amount) / 10000 : null,
       change_pct: it.changepercent != null ? Number(it.changepercent) : null,
       timestamp: it.trade != null ? Date.now() : null,
     })
