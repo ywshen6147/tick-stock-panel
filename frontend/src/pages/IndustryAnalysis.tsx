@@ -20,6 +20,7 @@ import { toNavItems, type NavItem } from '@/lib/listNav'
 import { RpsRotationDialog } from '@/components/RpsRotationDialog'
 import { api, type MarketSnapshotRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
+import { isMarketOpen } from '@/lib/kline'
 import { storage } from '@/lib/storage'
 import { fmtBigNum, fmtPct, priceColorClass } from '@/lib/format'
 import { cn } from '@/lib/cn'
@@ -319,7 +320,10 @@ export function IndustryAnalysis() {
   const marketQuery = useQuery({
     queryKey: QK.marketSnapshot,
     queryFn: api.marketSnapshot,
-    staleTime: 60_000,
+    staleTime: 30_000,
+    // 盘中实时刷新聚合统计: 全市场快照较重, 用 30s 轮询 (行情服务 6s 推新,
+    // 30s 足够聚合口径稳定又不浪费请求); 收盘后停止轮询。
+    refetchInterval: (query) => (isMarketOpen() ? 30_000 : false),
   })
 
   const marketMap = useMemo(() => buildMarketMap(marketQuery.data?.rows ?? []), [marketQuery.data?.rows])

@@ -88,6 +88,17 @@ function cnNowHHMM(): string {
   return new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date())
 }
 
+/** 是否处于 A 股连续竞价时段 (北京时间工作日 09:30-15:00)。
+ * 用于「盘中等价轮询、收盘即停」的查询 (概念/行业聚合、分时等)。
+ * 午休 11:30-13:00 也返回 true (轮询无害, 值不变即不发请求)。 */
+export function isMarketOpen(): boolean {
+  const now = new Date()
+  const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', weekday: 'short' }).format(now)
+  if (day === 'Sat' || day === 'Sun') return false
+  const hm = cnNowHHMM()
+  return hm >= '09:30' && hm <= '15:00'
+}
+
 /** 行 datetime ('YYYY-MM-DD HH:MM:SS' 北京墙钟契约) → 'HH:MM'; 非常规格式返回 ''。 */
 function rowMinute(r: { datetime?: string } | undefined): string {
   const s = String(r?.datetime ?? '')
