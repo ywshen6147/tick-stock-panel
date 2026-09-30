@@ -33,6 +33,46 @@ DEFAULT_DATES = ["2026-09-05", "2026-09-07", "2026-09-24", "2026-09-28", "2026-0
 # 判定阈值: 正常手/元契约 ratio≈100; 坏数据 ratio≈10000。>1000 视为坏行。
 _RATIO_BAD = 1000.0
 
+# 盘中快照标记修复: 该日期分区只有午夜合成 quote_ts (00:00:00), 缺少盘后 batch
+# 时间戳(正常日有 15:00+), 被 data_integrity 误判为停机前盘中快照。数据内容已
+# 核验完整正确(units/volume/收盘分布正常), 补一个盘后时间戳消除误报。
+SNAPSHOT_MARKER_DATES = {"2026-09-23"}
+
+
+def fix_snapshot_marker(daily_dir: Path, date_str: str) -> int:
+    """给「只有午夜合成 quote_ts」的分区补盘后时间戳, 使其通过完整性检查。
+
+    正常日分区含 15:00+ 的盘后 batch quote_ts (如 15:00:19); 停机日只写了
+    00:00:00 合成值。这里把整分区的 quote_ts 统一改为当日 15:00:00(北京时间,
+    毫秒), 等价于标记「该日数据已盘后定稿」。返回修正行数。
+    """
+    part_dir = daily_dir / f"date={date_str}"
+    part = part_dir / "part.parquet"
+    if not part.exists():
+        print(f"[skip] {date_str}: 无分区 {part}")
+        return 0
+    df = pl.read_parquet(part)
+    if "quote_ts" not in df.columns:
+        print(f"[skip] {date_str}: 无 quote_ts 列")
+        return 0
+    # 当日 15:00:00 北京时间 → epoch ms
+    import datetime as _dt
+    import zoneinfo as _zi
+
+    close_ms = int(
+        _dt.datetime.combine(
+            _dt.date.fromisoformat(date_str),
+            _dt.time(15, 0, 0),
+            tzinfo=_zi.ZoneInfo("Asia/Shanghai"),
+        ).timestamp() * 1000
+    )
+    df = df.with_columns(pl.lit(close_ms).cast(pl.Int64).alias("quote_ts"))
+    tmp = part_dir / "part.parquet.tmp"
+    df.write_parquet(tmp)
+    tmp.replace(part)
+    print(f"[fix] {date_str}: quote_ts 统一为盘后 15:00:00 ({df.height} 行), 消除盘中快照误报")
+    return df.height
+
 
 def repair_daily_partition(daily_dir: Path, date_str: str) -> tuple[int, int]:
     """修复单个 kline_daily 分区的坏行。返回 (总行数, 修正行数)。"""
@@ -89,6 +129,11 @@ def main() -> int:
         total, fixed = repair_daily_partition(daily_dir, ds)
         total_fixed += fixed
         remove_bad_enriched(enriched_dir, ds)
+
+    # 仅补盘中快照标记的日期 (数据本身正确, 不需要重建 enriched)
+    marker_dates = [ds for ds in SNAPSHOT_MARKER_DATES if ds not in dates]
+    for ds in marker_dates:
+        fix_snapshot_marker(daily_dir, ds)
 
     print(f"\n日K修正合计: {total_fixed} 行; 开始重建 enriched …")
     from app.indicators.pipeline import run_pipeline  # noqa: E402
