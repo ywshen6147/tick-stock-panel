@@ -10,17 +10,34 @@
 ## 方案
 
 行情循环每 tick 都拿得到**快照自带的累计成交量/成交额**(真实值, 非合成),
-把关心的少数标的按**分钟**记一份极小历史, 即可派生与 `intraday_features`
-**同口径**的量能特征:
+把关心的少数标的按**分钟**记一份极小历史, 即可与 `intraday_features`
+**同口径**地重建:
 
     vol_ratio_N = 当前 N 分钟成交量之和 / 此前 N 分钟成交量之和
                   (按上/下午分组, 不跨午休)
-
-    分钟成交量 = 累计成交量(本分钟) - 累计成交量(上一分钟)
+    分钟成交量  = 累计成交量(本分钟) - 累计成交量(上一分钟)
 
 同时记录现价/当日高低, 于是还能得到 `open_30m_high/low`(上午前30分钟高低)
 以及分钟级 vwap 序列 —— 后者让"跌破均价线后收回"(V型) 这类**跨时点形态**
 第一次变得可判定。
+
+## 关键设计: 事件而非状态
+
+用真实分钟K 校准(688553, 2026-09-14~18, 1116 根 bar)发现两类问题:
+
+1. **"状态"会被高频重复计数**。例如"距当日最高≤0.3%"全天 20.9% 的 bar 成立,
+   直接用状态判定会让「量价背离」在 5 天内报 58 次(单日最多 33 次)。
+   → 四个形态全部改为**边沿事件**(由 False→True 的那一分钟才算), 58 → 28。
+
+2. **`vol_ratio_5m`(近5分钟/前5分钟)是"加速度", 不适用于判"放量"**。
+   实测 10 次上穿开盘30分钟高点中 9 次该比值 <0.8: 因为突破前刚经历放量拉升,
+   分母(前5分钟)偏大。用它会把放量突破误判为缩量。
+   → 新增 `vol_rel_5m` = 近5分钟量 / **当日每分钟均量**(水平比, 更贴近"放量"语义),
+      形态判定改用它; `vol_ratio_*` 仍照常上报。
+
+校准后频率(688553, 5 个交易日): v_shape 0.8/日, no_vol_push 0.6/日,
+vol_divergence 约 2.8/日; **ignite 为 0** —— 该样本内所有突破都是缩量的,
+按方法论本就不该点亮火(那属于「无量拉升」)。样本仅 5 天, 阈值属初始校准。
 
 ## 存储
 
@@ -43,16 +60,17 @@ logger = logging.getLogger(__name__)
 
 _LOCK = threading.Lock()
 
-# ── 派生阈值（与《海平分时擒牛》各讲对应；集中在此便于调参） ──────────
+# ── 派生阈值（经真实分钟K 校准的初值; 集中在此便于调参） ──────────────
 PUMP_PCT = 0.03            # 拉升/涨幅阈值: 相对开盘 ≥3% (第2/3讲)
-IGNITE_VOL = 2.0           # 点火/突破需"放量": 5分钟量比 ≥2
-SHRINK_VOL = 0.7           # "量能萎缩": 5分钟量比 <0.7
-NEAR_DAY_HIGH = 0.003      # 距当日最高 ≤0.3% 视为"创新高"
+IGNITE_VOL = 1.2           # 点火/突破需放量: vol_rel_5m ≥1.2 (相对当日均量)
+SHRINK_VOL = 0.7           # 量能萎缩: vol_rel_5m <0.7
 V_SHAPE_LOOKBACK_MIN = 10  # V型: 最近 10 分钟内曾跌破均价线
 OPEN_30M_MINUTES = 30      # 开盘 30 分钟(上午前30根)
+# 形态对外报「最近 N 分钟内发生过」——LLM 每 llm_interval_seconds(默认300s)才看一次盘,
+# 若只报"本分钟恰好发生", 5 分钟间隔会大概率整段错过事件。
+RECENT_WINDOW_MIN = 5
 
 _MORNING_END = 11 * 60 + 30
-_AFTERNOON_START = 13 * 60
 
 
 def _path(data_dir: Path, day: str) -> Path:
@@ -158,20 +176,72 @@ def load(data_dir: Path, day: str | None = None) -> dict[str, Any]:
 
 
 # ── 派生 ────────────────────────────────────────────────────────
+def _per_minute(minutes: dict[str, dict[str, Any]], order: list[str],
+                day_open: float | None) -> list[dict[str, Any]]:
+    """逐分钟算出判定所需的量（用于取"最后一分钟"与"上一分钟"做边沿比较）。
+
+    每分钟产出: price / vwap / cum_vol / delta / rel5 / pct_from_open /
+                day_high(截至该分钟的运行最高) / day_low / o30h / o30l
+    """
+    rows: list[dict[str, Any]] = []
+    # 上午每根 bar 的累计高/低, 用于开盘30分钟高低 (第 30 根定版)
+    am = [hh for hh in order if _session_of(hh) == 0]
+    o30h = o30l = None
+    if len(am) >= OPEN_30M_MINUTES:
+        hs = [_fnum((minutes[hh] or {}).get("h")) for hh in am[:OPEN_30M_MINUTES]]
+        ls = [_fnum((minutes[hh] or {}).get("l")) for hh in am[:OPEN_30M_MINUTES]]
+        hs = [h for h in hs if h]
+        ls = [l for l in ls if l]
+        o30h = max(hs) if hs else None
+        o30l = min(ls) if ls else None
+
+    prev_cum: float | None = None
+    run_high: float | None = None
+    run_low: float | None = None
+    for i, hh in enumerate(order, start=1):
+        c = minutes[hh] or {}
+        price = _fnum(c.get("p"))
+        cum_v, cum_a = _fnum(c.get("v")), _fnum(c.get("a"))
+        delta = (cum_v - prev_cum) if (cum_v is not None and prev_cum is not None) else cum_v
+        if cum_v is not None:
+            prev_cum = cum_v
+        h = _fnum(c.get("h"))
+        l = _fnum(c.get("l"))
+        if h is not None:
+            run_high = h if run_high is None else max(run_high, h)
+        if l is not None:
+            run_low = l if run_low is None else min(run_low, l)
+        vwap = (cum_a / (cum_v * 100.0)) if (cum_v and cum_a and cum_v > 0) else None
+        rows.append({
+            "hh": hh, "price": price, "vwap": vwap, "cum_vol": cum_v, "delta": delta,
+            "day_high": run_high, "day_low": run_low, "o30h": o30h, "o30l": o30l,
+            "pct_from_open": (price / day_open - 1.0) if (price and day_open) else None,
+            "idx": i,
+        })
+    # rel5 = 近5分钟量 / 当日每分钟均量（水平比, 比"加速度"更贴合"放量"语义）
+    for i, r in enumerate(rows):
+        if r["cum_vol"] and r["idx"] > 0:
+            avg = r["cum_vol"] / r["idx"]
+            win = [x["delta"] for x in rows[max(0, i - 4): i + 1] if x["delta"] is not None]
+            r["rel5"] = (sum(win) / (5.0 * avg)) if (avg > 0 and win) else None
+        else:
+            r["rel5"] = None
+    return rows
+
+
 def derive(data_dir: Path, symbols: list[str], day_open: dict[str, float] | None = None,
            now: datetime | None = None) -> dict[str, dict[str, Any]]:
-    """由快照历史派生量能与形态指标（与 intraday_features 同口径）。
+    """由快照历史派生量能与形态指标（与 intraday_features 同口径 + 边沿事件）。
 
-    ``day_open``: {symbol: 当日开盘价}，用于算 `pct_from_open`（形态判定需要）。
-                  缺省时该标的的 pct_from_open 为 None，相关形态布尔不成立。
+    ``day_open``: {symbol: 当日开盘价}；算 `pct_from_open` 与形态判定需要。
 
     返回 {symbol: {...}}，字段:
-      vol_ratio_1m/3m/5m_today   放量比（分上下午、不跨午休；窗口不满为 None）
-      open_30m_high_dist / low_dist
-      day_high_dist / day_low_dist
+      vol_ratio_1m/3m/5m_today   放量比（加速度; 分上下午、不跨午休）
+      vol_rel_5m                 近5分钟量 / 当日每分钟均量（**放量水平比**）
+      open_30m_high_dist / low_dist / day_high_dist / day_low_dist
       vwap / price / minutes / last_minute
-      pct_from_open / pct_vs_prev_close
-      v_shape / ignite / no_vol_push / vol_divergence   四个形态布尔（确定性判定）
+      pct_from_open
+      v_shape / ignite / no_vol_push / vol_divergence  四个形态（**边沿事件**）
     """
     data = load(data_dir, (now or cn_now()).strftime("%Y-%m-%d"))
     syms = data.get("symbols") or {}
@@ -187,96 +257,111 @@ def derive(data_dir: Path, symbols: list[str], day_open: dict[str, float] | None
         for hh in order:
             by_session[_session_of(hh)].append(hh)
 
-        res: dict[str, Any] = {"minutes": len(order), "last_minute": order[-1]}
-        cur = minutes[order[-1]] or {}
-        price = _fnum(cur.get("p"))
-        cum_v, cum_a = _fnum(cur.get("v")), _fnum(cur.get("a"))
-        vwap = round(cum_a / (cum_v * 100.0), 6) if (cum_v and cum_a and cum_v > 0) else None
+        rows = _per_minute(minutes, order, _fnum(days.get(sym)))
+        cur = rows[-1]
+        prev = rows[-2] if len(rows) >= 2 else None
 
-        # 1) 分钟成交量 = 累计量差值（下午首分钟自然跨午休累计，差值仍正确）
+        res: dict[str, Any] = {
+            "minutes": len(order), "last_minute": cur["hh"],
+            "price": cur["price"], "vwap": cur["vwap"], "vol_rel_5m": cur["rel5"],
+            "pct_from_open": cur["pct_from_open"],
+        }
+
+        # 1) 放量比(加速度; 与 intraday_features 完全同口径, 分上下午不跨午休)
         deltas: dict[int, list[float]] = {0: [], 1: []}
         for sess, hhs in by_session.items():
-            prev_cum: float | None = None
+            dcum: float | None = None
             for hh in hhs:
-                cum = _fnum((minutes[hh] or {}).get("v"))
-                if cum is None:
+                cv = _fnum((minutes[hh] or {}).get("v"))
+                if cv is None:
                     deltas[sess].append(0.0)
                     continue
-                deltas[sess].append(cum - prev_cum if prev_cum is not None else cum)
-                prev_cum = cum
-
-        # 2) vol_ratio_N = 当前N分钟量和 / 此前N分钟量和（优先当前时段）
+                deltas[sess].append(cv - dcum if dcum is not None else cv)
+                dcum = cv
         for n, key in ((1, "vol_ratio_1m_today"), (3, "vol_ratio_3m_today"), (5, "vol_ratio_5m_today")):
             val = None
             for sess in (1, 0):
                 d = deltas[sess]
                 if len(d) >= 2 * n:
-                    prev = sum(d[-2 * n:-n])
-                    if prev > 0:
-                        val = round(sum(d[-n:]) / prev, 6)
+                    pv = sum(d[-2 * n:-n])
+                    if pv > 0:
+                        val = round(sum(d[-n:]) / pv, 6)
                     break
             res[key] = val
-        vr5 = res["vol_ratio_5m_today"]
 
-        # 3) 开盘 30 分钟高低（上午前 30 分钟）
-        am = by_session[0]
-        o30h = o30l = None
-        if len(am) >= OPEN_30M_MINUTES:
-            highs = [_fnum((minutes[hh] or {}).get("h")) for hh in am[:OPEN_30M_MINUTES]]
-            lows = [_fnum((minutes[hh] or {}).get("l")) for hh in am[:OPEN_30M_MINUTES]]
-            highs = [h for h in highs if h]
-            lows = [l for l in lows if l]
-            o30h = round(max(highs), 4) if highs else None
-            o30l = round(min(lows), 4) if lows else None
+        # 2) 高度/涨幅类
+        o30h, o30l = cur["o30h"], cur["o30l"]
         res["open_30m_high"], res["open_30m_low"] = o30h, o30l
-        res["open_30m_high_dist"] = (round(price / o30h - 1.0, 6) if (price and o30h) else None)
-        res["open_30m_low_dist"] = (round(price / o30l - 1.0, 6) if (price and o30l) else None)
+        px = cur["price"]
+        res["open_30m_high_dist"] = (round(px / o30h - 1.0, 6) if (px and o30h) else None)
+        res["open_30m_low_dist"] = (round(px / o30l - 1.0, 6) if (px and o30l) else None)
+        res["day_high_dist"] = (round(px / cur["day_high"] - 1.0, 6) if (px and cur["day_high"]) else None)
+        res["day_low_dist"] = (round(px / cur["day_low"] - 1.0, 6) if (px and cur["day_low"]) else None)
 
-        # 4) 当日高低 + 相对开盘/昨收
-        allh = [h for h in (_fnum((minutes[hh] or {}).get("h")) for hh in order) if h]
-        alll = [l for l in (_fnum((minutes[hh] or {}).get("l")) for hh in order) if l]
-        day_high = max(allh) if allh else None
-        day_low = min(alll) if alll else None
-        res["day_high_dist"] = (round(price / day_high - 1.0, 6) if (price and day_high) else None)
-        res["day_low_dist"] = (round(price / day_low - 1.0, 6) if (price and day_low) else None)
+        # 3) 形态 —— 内部按**边沿事件**判定, 对外报「**最近 N 分钟内发生过**」。
+        #    原因: LLM 每 llm_interval_seconds(默认 300s)才看一次盘, 若只报"本分钟
+        #    恰好发生", 五分钟的间隔会大概率整段错过事件。故对外给一个时间窗,
+        #    并附 `*_age_min` 说明是多久前发生的（0 = 本分钟）。
+        ages = _pattern_ages(rows)
+        for name, age in ages.items():
+            res[name] = bool(age is not None and age <= RECENT_WINDOW_MIN)
+            res[f"{name}_age_min"] = age
 
-        do = _fnum(days.get(sym))
-        res["pct_from_open"] = (round(price / do - 1.0, 6) if (price and do) else None)
-        res["vwap"], res["price"] = vwap, price
-
-        # 5) 形态布尔（确定性，避免让模型自己算）
-        #    V型: 当日曾拉升≥3% + 近 lookback 分钟内曾跌破均价线 + 当前已收回
-        pumped = False
-        if do:
-            for hh in order:
-                px = _fnum((minutes[hh] or {}).get("p"))
-                if px and px / do - 1.0 >= PUMP_PCT:
-                    pumped = True
-                    break
-        below_recent = False
-        if price and vwap:
-            for hh in order[-V_SHAPE_LOOKBACK_MIN:]:
-                px = _fnum((minutes[hh] or {}).get("p"))
-                cv, ca = _fnum((minutes[hh] or {}).get("v")), _fnum((minutes[hh] or {}).get("a"))
-                if px and cv and ca and cv > 0 and px < ca / (cv * 100.0):
-                    below_recent = True
-                    break
-        res["v_shape"] = bool(pumped and below_recent and price and vwap and price > vwap)
-
-        pct_open = res["pct_from_open"]
-        res["ignite"] = bool(
-            price and o30h and price >= o30h
-            and vr5 is not None and vr5 >= IGNITE_VOL
-            and pct_open is not None and pct_open >= PUMP_PCT
-        )
-        res["no_vol_push"] = bool(
-            vwap and price and price > vwap
-            and pct_open is not None and pct_open >= PUMP_PCT
-            and vr5 is not None and vr5 < SHRINK_VOL
-        )
-        res["vol_divergence"] = bool(
-            price and day_high and abs(price / day_high - 1.0) <= NEAR_DAY_HIGH
-            and vr5 is not None and vr5 < SHRINK_VOL
-        )
         out[sym] = res
     return out
+
+
+def _pattern_ages(rows: list[dict[str, Any]]) -> dict[str, int | None]:
+    """逐分钟判定四个形态的**边沿**, 返回各自"最近一次发生距今多少分钟"(None=从未)。"""
+    last: dict[str, int | None] = {"v_shape": None, "ignite": None,
+                                   "no_vol_push": None, "vol_divergence": None}
+    pumped_ever = False
+    n = len(rows)
+    for i, r in enumerate(rows):
+        p = rows[i - 1] if i >= 1 else None
+        px, vwap, rel5 = r["price"], r["vwap"], r["rel5"]
+        pct = r["pct_from_open"]
+        if (pct or -9) >= PUMP_PCT:
+            pumped_ever = True
+
+        # 点火突破: 上穿开盘30分钟高点 (用 <=, 标记价定版时价格常正好等于该高点)
+        if px and r["o30h"] and px >= r["o30h"]:
+            if p is None:
+                crossed = True
+            elif p["o30h"] and p["price"]:
+                crossed = p["price"] <= p["o30h"]
+            else:
+                crossed = False
+            if crossed and rel5 is not None and rel5 >= IGNITE_VOL \
+                    and pct is not None and pct >= PUMP_PCT:
+                last["ignite"] = i
+
+        # V型确认: 当日曾拉升≥3% + 近 lookback 分钟内曾跌破均价线 + 本分钟刚收回
+        if pumped_ever and px and vwap and px > vwap:
+            lo = max(0, i - V_SHAPE_LOOKBACK_MIN + 1)
+            below = any((x["price"] and x["vwap"] and x["price"] < x["vwap"])
+                        for x in rows[lo:i + 1])
+            was_below = bool(p and p["price"] and p["vwap"] and p["price"] <= p["vwap"])
+            if below and was_below:
+                last["v_shape"] = i
+
+        # 无量拉升诱多: 涨幅≥3% + 价>均价线 + 缩量（组合边沿）
+        nvp = bool(pct is not None and pct >= PUMP_PCT and px and vwap and px > vwap
+                   and rel5 is not None and rel5 < SHRINK_VOL)
+        p_nvp = bool(p and p["pct_from_open"] is not None and p["pct_from_open"] >= PUMP_PCT
+                     and p["price"] and p["vwap"] and p["price"] > p["vwap"]
+                     and p["rel5"] is not None and p["rel5"] < SHRINK_VOL)
+        if nvp and not p_nvp:
+            last["no_vol_push"] = i
+
+        # 量价背离: 运行最高价抬升(真创新高) + 缩量（组合边沿）
+        vd = bool(px and r["day_high"] and rel5 is not None and rel5 < SHRINK_VOL
+                  and p and p["day_high"] and r["day_high"] > p["day_high"])
+        p_vd = bool(p and p["price"] and p["day_high"] and p["rel5"] is not None
+                    and p["rel5"] < SHRINK_VOL
+                    and i >= 2 and rows[i - 2]["day_high"]
+                    and p["day_high"] > rows[i - 2]["day_high"])
+        if vd and not p_vd:
+            last["vol_divergence"] = i
+
+    return {k: (None if v is None else (n - 1 - v)) for k, v in last.items()}

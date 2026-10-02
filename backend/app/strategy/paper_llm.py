@@ -69,13 +69,15 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
   2. V型确认：开盘放量拉升≥3% 后跌破均价线、又在短时间内收回（第2讲·图pg007/pg009）
      → 系统判据: `v_shape == true`
   3. 点火/横盘突破：放量突破前高、相对开盘涨幅≥3%（第3讲·图pg012/pg013、第2讲·图pg006）
-     → 系统判据: `ignite == true`（价 ≥ 开盘30分钟最高 + 5分钟量比 ≥2 + 涨幅 ≥3%）
+     → 系统判据: `ignite == true`（刚上穿开盘30分钟最高 + `vol_rel_5m ≥1.2` + 涨幅 ≥3%）
+     ⚠️ 这是**罕见**信号：真实样本里多数突破是缩量的（那属于下面第 5 条无量诱多）。
+        `ignite` 长期为 false 是正常的，不要为凑信号而放宽标准。
 卖点（动能衰竭即走，纪律优先）：
   4. 跌破分时均价线（标准 S 点，也是日内减仓纪律）（第2讲/第4讲）
   5. 无量拉升诱多：涨≥3% 但量能萎缩（第4讲·图pg021）
-     → 系统判据: `no_vol_push == true`（涨幅 ≥3% + 价 > 均价 + 5分钟量比 <0.7）
+     → 系统判据: `no_vol_push == true`（涨幅 ≥3% + 价 > 均价 + `vol_rel_5m <0.7`）
   6. 量价背离：创当日新高但量能萎缩（第4讲·图pg019）
-     → 系统判据: `vol_divergence == true`（距当日最高 ≤0.3% + 5分钟量比 <0.7）
+     → 系统判据: `vol_divergence == true`（刚创当日新高 + `vol_rel_5m <0.7`）
   7. 硬止损：跌破当日开盘价 3%（第2讲风控：止损2-4个点）
 风控纪律：纪律 > 情绪；止损 > 扛单；胜率 > 单次暴利；没有符合条件的机会就**不交易**。
 
@@ -104,14 +106,26 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
 
 ### 系统已替你算好的形态布尔（`v_shape` / `ignite` / `no_vol_push` / `vol_divergence`）
 
-**不要自己重算这四个**，直接采信；它们为 `false` 就代表条件不成立：
+**不要自己重算这四个**，直接采信；它们为 `false` 就代表条件不成立。
+
+它们都是**事件型**判定：内部在「条件由不成立变为成立的那一分钟」记一次，
+对外报告的是「**最近 5 分钟内发生过**」（对应你每 300 秒判断一次的频率）。
+每个字段还配一个 `*_age_min`（距今多少分钟，`0` = 本分钟刚发生，`null` = 当日从未发生）。
+
+所以 `false` 代表**近 5 分钟内没有发生**，不代表形态不存在。判断时优先看
+`*_age_min`：越小越"新鲜"，越值得按该信号处理。
 
 | 字段 | 成立条件（系统判定）|
 |---|---|
-| `v_shape` **V型确认** | 当日曾拉升 ≥3%（`pct_from_open ≥ 0.03`）+ 近 10 分钟内**曾跌破**均价线 + 当前价**已收回**到均价线上方 |
-| `ignite` **点火突破** | 当前价 ≥ **开盘30分钟最高价** + `vol_ratio_5m_today ≥ 2.0`（放量）+ `pct_from_open ≥ 0.03` |
-| `no_vol_push` **无量拉升诱多** | `pct_from_open ≥ 0.03` + 现价 > 均价线 + `vol_ratio_5m_today < 0.7`（量能萎缩）|
-| `vol_divergence` **量价背离** | 现价距当日最高 ≤0.3%（创新高）+ `vol_ratio_5m_today < 0.7` |
+| `v_shape` **V型确认** | 当日曾拉升 ≥3% + 近 10 分钟内**曾跌破**均价线 + **本分钟刚收回**到均价线上方 |
+| `ignite` **点火突破** | **本分钟刚上穿**开盘30分钟最高价 + 放量（`vol_rel_5m ≥ 1.2`）+ `pct_from_open ≥ 0.03` |
+| `no_vol_push` **无量拉升诱多** | `pct_from_open ≥ 0.03` + 现价 > 均价线 + 缩量（`vol_rel_5m < 0.7`），且**本分钟刚成立** |
+| `vol_divergence` **量价背离** | **本分钟刚创出**当日新高（距最高 ≤0.1%）+ 缩量（`vol_rel_5m < 0.7`）|
+
+**量能口径**：`vol_rel_5m` = 近 5 分钟成交量 / **当日每分钟均量**（水平比，
+>1.2 放量、<0.7 缩量）。它比 `vol_ratio_5m_today`（近5分钟/前5分钟的**加速度**）
+更适合判"放量"：突破前常刚经历放量拉升，加速度比反而 <1，会把放量突破误判为缩量。
+两个字段都给，量能判断**优先用 `vol_rel_5m`**。
 
 量能类字段（`vol_ratio_*`、`open_30m_*`）**只在 `source` 为 `minute` 或
 `snapshot+hist` 时可用**；为 `snapshot` 时它们恒为 null，此时上述四个条件
@@ -464,6 +478,7 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
     feature_keys = (
         "price", "vwap", "pct_from_open", "pct_vs_prev_close",
         "vol_ratio_1m_today", "vol_ratio_3m_today", "vol_ratio_5m_today",
+        "vol_rel_5m",
         "day_high_dist", "day_low_dist",
         "open_30m_high_dist", "open_30m_low_dist",
     )
@@ -481,10 +496,13 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
             if v is None:
                 v = sm.get(k)
             merged[k] = v
-        # 四个形态的确定性判定（由历史推出；无历史时不出现该字段）
+        # 四个形态的判定（由历史推出）+ 各自的"距今多少分钟"
         for pk in pattern_keys:
             if pk in hs:
                 merged[pk] = hs[pk]
+            age_key = f"{pk}_age_min"
+            if age_key in hs:
+                merged[age_key] = hs[age_key]
         merged["minutes_recorded"] = hs.get("minutes")
         merged["last_minute"] = hs.get("last_minute")
         if mf.get("vwap") is not None:
