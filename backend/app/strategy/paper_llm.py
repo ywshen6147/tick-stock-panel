@@ -67,11 +67,15 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
 买点（确定性买点，必须量价配合）：
   1. 回踩均价线不破：现价上穿分时均价线并站稳（第2讲·图pg005）
   2. V型确认：开盘放量拉升≥3% 后跌破均价线、又在短时间内收回（第2讲·图pg007/pg009）
+     → 系统判据: `v_shape == true`
   3. 点火/横盘突破：放量突破前高、相对开盘涨幅≥3%（第3讲·图pg012/pg013、第2讲·图pg006）
+     → 系统判据: `ignite == true`（价 ≥ 开盘30分钟最高 + 5分钟量比 ≥2 + 涨幅 ≥3%）
 卖点（动能衰竭即走，纪律优先）：
   4. 跌破分时均价线（标准 S 点，也是日内减仓纪律）（第2讲/第4讲）
   5. 无量拉升诱多：涨≥3% 但量能萎缩（第4讲·图pg021）
+     → 系统判据: `no_vol_push == true`（涨幅 ≥3% + 价 > 均价 + 5分钟量比 <0.7）
   6. 量价背离：创当日新高但量能萎缩（第4讲·图pg019）
+     → 系统判据: `vol_divergence == true`（距当日最高 ≤0.3% + 5分钟量比 <0.7）
   7. 硬止损：跌破当日开盘价 3%（第2讲风控：止损2-4个点）
 风控纪律：纪律 > 情绪；止损 > 扛单；胜率 > 单次暴利；没有符合条件的机会就**不交易**。
 
@@ -91,15 +95,27 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
 **任何字段为 null 时不要脑补数值，按"数据不足"处理**。
 
 `features[symbol].source` 表示该标的分时数据的来源：
-- `"minute"`   = 来自真实分钟K（字段最全）
-- `"snapshot"` = 来自实时快照的**当日累计成交量/成交额**推得（`vwap` 可信，
-  但 **`vol_ratio_*` / `open_30m_*` 恒为 null** —— 这些需要日内量序列，拿不到）
-- `"none"`     = 无有效分时数据（此时必须 hold）
+- `"minute"`        = 来自真实分钟K（字段最全）
+- `"snapshot+hist"` = 快照 + **系统自建的分钟量能序列**（用快照自带的当日累计
+  成交额/成交量按分钟重建，与真实分钟K**同口径**）→ `vol_ratio_*` / `open_30m_*`
+  可用，四个形态布尔可用；**这是当前部署的常态**
+- `"snapshot"`      = 仅快照基础（`vol_ratio_*` 为 null，量能类条件不可判）
+- `"none"`          = 无有效分时数据（必须 hold）
 
-⚠️ 当 `source == "snapshot"` 时，**不要**使用 `vol_ratio_*` 或 `open_30m_*` 做判断
-（它们为 null）；可以正常使用 `vwap` / `pct_from_open` / `pct_vs_prev_close` /
-`day_high_dist` / `day_low_dist`。量能类买点（放量拉升、缩量末端、无量诱多、
-量价背离）在此来源下条件不完整，应谨慎或输出 hold。
+### 系统已替你算好的形态布尔（`v_shape` / `ignite` / `no_vol_push` / `vol_divergence`）
+
+**不要自己重算这四个**，直接采信；它们为 `false` 就代表条件不成立：
+
+| 字段 | 成立条件（系统判定）|
+|---|---|
+| `v_shape` **V型确认** | 当日曾拉升 ≥3%（`pct_from_open ≥ 0.03`）+ 近 10 分钟内**曾跌破**均价线 + 当前价**已收回**到均价线上方 |
+| `ignite` **点火突破** | 当前价 ≥ **开盘30分钟最高价** + `vol_ratio_5m_today ≥ 2.0`（放量）+ `pct_from_open ≥ 0.03` |
+| `no_vol_push` **无量拉升诱多** | `pct_from_open ≥ 0.03` + 现价 > 均价线 + `vol_ratio_5m_today < 0.7`（量能萎缩）|
+| `vol_divergence` **量价背离** | 现价距当日最高 ≤0.3%（创新高）+ `vol_ratio_5m_today < 0.7` |
+
+量能类字段（`vol_ratio_*`、`open_30m_*`）**只在 `source` 为 `minute` 或
+`snapshot+hist` 时可用**；为 `snapshot` 时它们恒为 null，此时上述四个条件
+一律视为不成立（不要凭感觉补值）。
 
 ## 硬性要求
 - 只依据给出的数据判断，**绝不编造**行情；数据不足就输出 hold。
@@ -357,6 +373,32 @@ def _snapshot_metrics(frame: Any, symbols: list[str],
     return out
 
 
+def _day_open_map(frame: Any, symbols: list[str]) -> dict[str, float]:
+    """从行情帧取当日开盘价（形态判定需要 pct_from_open 时用）。"""
+    out: dict[str, float] = {}
+    if frame is None:
+        return out
+    try:
+        import polars as pl
+
+        cols = set(getattr(frame, "columns", []) or [])
+        if "symbol" not in cols or "open" not in cols:
+            return out
+        sub = (frame.select(["symbol", "open"])
+               .filter(pl.col("symbol").cast(pl.Utf8).is_in(symbols)))
+        for r in sub.to_dicts():
+            sym = str(r.get("symbol") or "").strip()
+            try:
+                f = float(r.get("open"))
+            except (TypeError, ValueError):
+                continue
+            if sym and f > 0:
+                out[sym] = f
+    except Exception:
+        logger.debug("day open extract failed", exc_info=True)
+    return out
+
+
 # ── 上下文构建 ──────────────────────────────────────────────────
 def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
                    snapshot: dict[str, float], symbols: list[str],
@@ -402,11 +444,22 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
         if p:
             quotes[s] = round(float(p), 4)
 
-    # 分时特征：分钟K（若当日分区存在，字段最全）优先；不足处用**实时快照的
-    # 当日累计量额**兜底（vwap 由此可得，不依赖分钟K/不依赖 TickFlow）。
+    # 分时特征三层取数，优先级 分钟K > 快照历史(自建量能序列) > 快照基础指标：
+    #   1) 真实分钟K（若当日分区存在）字段最全
+    #   2) 自建快照历史：用**快照自带的累计量额**按分钟重建量能序列，同口径算出
+    #      vol_ratio_* / open_30m_*，并给出四个形态布尔（V型/点火/无量诱多/量价背离）
+    #   3) 快照基础：vwap(=累计额/累计量)、涨跌幅、当日高低
     prev_close = _prev_close_map(data_dir, symbols)
     minute_feat = _latest_intraday_features(data_dir, symbols)
     snap_metrics = _snapshot_metrics(quote_frame, symbols, prev_close)
+    hist: dict[str, dict[str, Any]] = {}
+    try:
+        from app.strategy import intraday_history
+
+        hist = intraday_history.derive(data_dir, symbols,
+                                      day_open=_day_open_map(quote_frame, symbols))
+    except Exception:
+        logger.debug("intraday history derive failed", exc_info=True)
 
     feature_keys = (
         "price", "vwap", "pct_from_open", "pct_vs_prev_close",
@@ -414,18 +467,32 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
         "day_high_dist", "day_low_dist",
         "open_30m_high_dist", "open_30m_low_dist",
     )
+    pattern_keys = ("v_shape", "ignite", "no_vol_push", "vol_divergence")
     features: dict[str, dict[str, Any]] = {}
     for sym in symbols:
         mf = minute_feat.get(sym) or {}
+        hs = hist.get(sym) or {}
         sm = snap_metrics.get(sym) or {}
         merged: dict[str, Any] = {}
         for k in feature_keys:
             v = mf.get(k)
-            merged[k] = v if v is not None else sm.get(k)
+            if v is None:
+                v = hs.get(k)
+            if v is None:
+                v = sm.get(k)
+            merged[k] = v
+        # 四个形态的确定性判定（由历史推出；无历史时不出现该字段）
+        for pk in pattern_keys:
+            if pk in hs:
+                merged[pk] = hs[pk]
+        merged["minutes_recorded"] = hs.get("minutes")
+        merged["last_minute"] = hs.get("last_minute")
         if mf.get("vwap") is not None:
-            merged["source"] = "minute"          # 真实分钟K
+            merged["source"] = "minute"           # 真实分钟K
+        elif hs.get("vwap") is not None:
+            merged["source"] = "snapshot+hist"    # 快照 + 自建量能序列（字段接近完整）
         elif sm.get("vwap") is not None:
-            merged["source"] = "snapshot"        # 实时快照累计量额（可信 vwap）
+            merged["source"] = "snapshot"         # 仅快照基础（无量比）
         else:
             merged["source"] = "none"
         merged["bar_time"] = mf.get("bar_time")
@@ -929,6 +996,15 @@ def maybe_run(data_dir: Path, account_id: str, snapshot: dict[str, float],
         acc = paper.get_account(data_dir, account_id)
         if acc is None or auto_mode(acc) != AUTO_MODE_LLM:
             return False
+        # 每 tick 记录快照历史（放在节流/时段闸门**之前**）：量能与形态派生依赖
+        # 分钟序列，只在真正决策时才采样会在分钟桶里留下大片空洞。
+        try:
+            from app.strategy import intraday_history
+
+            intraday_history.record(data_dir, quote_frame,
+                                    resolve_symbols(data_dir, account_id, acc), now=now)
+        except Exception:
+            logger.debug("intraday history record failed", exc_info=True)
         if str(acc.get("status") or "active") != "active":
             return False
         if not in_continuous_session(now):
