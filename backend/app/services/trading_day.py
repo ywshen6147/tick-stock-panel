@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import dataclass
@@ -55,13 +56,79 @@ class _Cache:
 
 _CACHE = _Cache()
 
+# ── 人工覆盖清单 ────────────────────────────────────────────────
+# 为什么需要: fuyao 交易日历只覆盖滚动一年窗口, 窗口外的日期探针无法确定判定
+# (例如国庆后首个交易日 2026-10-08 不在日历内)。这张清单让人工把**已确定**的
+# 休市/交易日写进运行时配置, 优先级高于日历与行情戳。
+# 文件: <data_dir>/user_data/market_calendar_overrides.json
+#   {"closed": ["2026-10-01", ...], "trading": ["2026-10-08", ...]}
+_OVERRIDE_TTL_S = 120.0
+_OVERRIDE_LOCK = threading.Lock()
+_OVERRIDE_CACHE: tuple[float, set[object], set[object]] = (0.0, set(), set())
+
+
+def _override_path():
+    from app.config import settings
+
+    return settings.data_dir / "user_data" / "market_calendar_overrides.json"
+
+
+def _load_overrides() -> tuple[set[object], set[object]]:
+    """读覆盖清单 (按文件 mtime + TTL 缓存)。文件缺失/损坏 → 两个空集合。"""
+    global _OVERRIDE_CACHE
+    import os
+    import time as _time
+
+    try:
+        p = _override_path()
+        if not p.exists():
+            return set(), set()
+        mtime = os.path.getmtime(p)
+        with _OVERRIDE_LOCK:
+            ts, closed, trading = _OVERRIDE_CACHE
+            if ts and (_time.monotonic() - ts) < _OVERRIDE_TTL_S and mtime <= ts:
+                return closed, trading
+        from datetime import date as _date
+
+        raw = json.loads(p.read_text(encoding="utf-8"))
+
+        def _parse(key: str) -> set[object]:
+            out: set[object] = set()
+            for s in raw.get(key) or []:
+                try:
+                    out.add(_date.fromisoformat(str(s)[:10]))
+                except ValueError:
+                    continue
+            return out
+
+        closed, trading = _parse("closed"), _parse("trading")
+        with _OVERRIDE_LOCK:
+            _OVERRIDE_CACHE = (_time.monotonic(), closed, trading)
+        return closed, trading
+    except Exception:  # noqa: BLE001 — 覆盖清单不可用不应影响探针
+        return set(), set()
+
 
 def reset_cache() -> None:
     """清空探针缓存 (测试用)。"""
+    global _OVERRIDE_CACHE
     with _CACHE_LOCK:
         _CACHE.day = None
         _CACHE.verdict = None
         _CACHE.probed_at = 0.0
+    with _OVERRIDE_LOCK:
+        _OVERRIDE_CACHE = (0.0, set(), set())
+
+
+def _probe_overrides(now: datetime) -> bool | None:
+    """人工覆盖清单: 命中休市 → False, 命中交易日 → True, 未列出 → None。"""
+    closed, trading = _load_overrides()
+    d = now.date()
+    if d in closed:
+        return False
+    if d in trading:
+        return True
+    return None
 
 
 def _probe_fuyao(now: datetime) -> bool | None:
@@ -120,6 +187,10 @@ def is_trading_day(now: datetime | None = None) -> bool | None:
     结论按 TTL 缓存。线程安全: 实时行情与分钟增量两个线程共用。
     """
     now = now or cn_now()
+    # 0) 人工覆盖清单优先级最高 (含"把周末标为交易日"这类极端情形)。
+    override = _probe_overrides(now)
+    if override is not None:
+        return override
     if now.weekday() >= 5:
         return False
 
