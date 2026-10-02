@@ -65,7 +65,13 @@ def reset_cache() -> None:
 
 
 def _probe_fuyao(now: datetime) -> bool | None:
-    """fuyao 交易日历: 今天在列表内 ⇔ 交易日。未配置 fuyao / 失败 → None。"""
+    """fuyao 交易日历: 今天在列表内 ⇔ 交易日。未配置 fuyao / 失败 → None。
+
+    注意: 日历经实测只覆盖一段窗口 (2025-10-09 ~ 2026-09-30)。**超出窗口不等于休市** ——
+    直接 `in days` 会把"日历没覆盖到"误判成节假日, 令次日(如国庆后 10-08)被当作休市:
+    实时行情轮询会据此降档停摆、盘后分钟K补齐也会被跳过。故超出 [min, max] 时
+    返回 None(未知), 交由探测链下一环(tickflow 戳)判定。
+    """
     try:
         from app.data_providers import custom as custom_sources
 
@@ -73,7 +79,12 @@ def _probe_fuyao(now: datetime) -> bool | None:
             return None
         provider = custom_sources.get_provider("fuyao")
         days = provider.trading_days()
-        return now.date() in days if days else None
+        if not days:
+            return None
+        today = now.date()
+        if today < min(days) or today > max(days):
+            return None
+        return today in days
     except Exception:  # noqa: BLE001 — 探针失败按未知处理, 不上抛
         return None
 

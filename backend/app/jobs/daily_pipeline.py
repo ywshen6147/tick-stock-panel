@@ -1352,6 +1352,19 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         if not preferences.get_minute_sync_enabled():
             logger.info("分钟K 盘后补齐: 偏好已关闭 minute_sync_enabled, 跳过")
             return
+        # 交易日闸门: cron 的 mon-fri 挡不住节假日(如国庆 10/5~10/7 是工作日但休市)。
+        # is_trading_day: 周末零成本直判; 工作日走 fuyao 日历 → tickflow 戳。
+        # **只在确定休市(False)时跳过**; None(未知, 例如日历未覆盖的日期)时照常执行 ——
+        # 宁可多跑一次(拉取幂等), 也别在真交易日漏补。
+        try:
+            from app.services import trading_day
+
+            verdict = trading_day.is_trading_day()
+        except Exception:
+            verdict = None
+        if verdict is False:
+            logger.info("分钟K 盘后补齐: 今日休市, 跳过")
+            return
         app_state = _get_app_state()
         repo_live = getattr(app_state, "repo", None) or repo
         capset_live = getattr(app_state, "capabilities", None) or capset
