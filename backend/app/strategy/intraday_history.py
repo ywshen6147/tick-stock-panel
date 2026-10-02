@@ -248,10 +248,16 @@ def _per_minute(minutes: dict[str, dict[str, Any]], order: list[str],
 
 
 def derive(data_dir: Path, symbols: list[str], day_open: dict[str, float] | None = None,
-           now: datetime | None = None) -> dict[str, dict[str, Any]]:
+           now: datetime | None = None,
+           recent_window_min: int | None = None) -> dict[str, dict[str, Any]]:
     """由快照历史派生量能与形态指标（与 intraday_features 同口径 + 边沿事件）。
 
     ``day_open``: {symbol: 当日开盘价}；算 `pct_from_open` 与形态判定需要。
+
+    ``recent_window_min``: 形态对外报"最近多少分钟内发生过"的窗口。调用方应传入
+    与决策间隔匹配的值（见 paper_llm：`max(RECENT_WINDOW_MIN, 间隔分钟 + 1)`）——
+    否则把 `llm_interval_seconds` 调大后，形态会在两次决策之间过期，静默丢信号。
+    缺省/非正数 → 用 `RECENT_WINDOW_MIN`。
 
     返回 {symbol: {...}}，字段:
       vol_ratio_1m/3m/5m_today   放量比（加速度; 分上下午、不跨午休）
@@ -260,7 +266,14 @@ def derive(data_dir: Path, symbols: list[str], day_open: dict[str, float] | None
       vwap / price / minutes / last_minute
       pct_from_open
       v_shape / ignite / no_vol_push / vol_divergence  四个形态（**边沿事件**）
+      pattern_window_min         本次采用的有效窗口（分钟）
     """
+    try:
+        win = int(recent_window_min) if recent_window_min else RECENT_WINDOW_MIN
+    except (TypeError, ValueError):
+        win = RECENT_WINDOW_MIN
+    if win <= 0:
+        win = RECENT_WINDOW_MIN
     data = load(data_dir, (now or cn_now()).strftime("%Y-%m-%d"))
     syms = data.get("symbols") or {}
     days = day_open or {}
@@ -321,8 +334,9 @@ def derive(data_dir: Path, symbols: list[str], day_open: dict[str, float] | None
         #    恰好发生", 五分钟的间隔会大概率整段错过事件。故对外给一个时间窗,
         #    并附 `*_age_min` 说明是多久前发生的（0 = 本分钟）。
         ages = _pattern_ages(rows)
+        res["pattern_window_min"] = win
         for name, age in ages.items():
-            res[name] = bool(age is not None and age <= RECENT_WINDOW_MIN)
+            res[name] = bool(age is not None and age <= win)
             res[f"{name}_age_min"] = age
 
         out[sym] = res

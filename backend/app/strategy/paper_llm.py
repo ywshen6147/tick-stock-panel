@@ -82,6 +82,8 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
   6. 量价背离：创当日新高但量能萎缩（第4讲·图pg019）
      → 系统判据: `vol_divergence == true`（刚创当日新高 + `vol_rel_5m <0.7`）
   7. 硬止损：跌破当日开盘价 3%（第2讲风控：止损2-4个点）
+  8. 平低开直接跳水：平/低开且相对开盘再跌 ≥1%（第4讲·图pg017）
+     → 系统判据: `flat_low_dive == true`（状态型）
 风控纪律：纪律 > 情绪；止损 > 扛单；胜率 > 单次暴利；没有符合条件的机会就**不交易**。
 
 ## 输入字段口径（features 里每个标的最新一根已完成分钟bar）
@@ -112,7 +114,8 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
 **不要自己重算这四个**，直接采信；它们为 `false` 就代表条件不成立。
 
 它们都是**事件型**判定：内部在「条件由不成立变为成立的那一分钟」记一次，
-对外报告的是「**最近 5 分钟内发生过**」（对应你每 300 秒判断一次的频率）。
+对外报告的是「**最近 `pattern_window_min` 分钟内发生过**」——
+该窗口由系统按你的决策间隔自动设定（`max(5, 间隔分钟 + 1)`），所以调大间隔也不会漏判。
 每个字段还配一个 `*_age_min`（距今多少分钟，`0` = 本分钟刚发生，`null` = 当日从未发生）。
 
 所以 `false` 代表**近 5 分钟内没有发生**，不代表形态不存在。判断时优先看
@@ -124,6 +127,7 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
 | `ignite` **点火突破** | **本分钟刚上穿**开盘30分钟最高价 + 放量（`vol_rel_5m ≥ 1.2`）+ `pct_from_open ≥ 0.03` |
 | `no_vol_push` **无量拉升诱多** | `pct_from_open ≥ 0.03` + 现价 > 均价线 + 缩量（`vol_rel_5m < 0.7`），且**本分钟刚成立** |
 | `vol_divergence` **量价背离** | **本分钟刚创出**当日新高（距最高 ≤0.1%）+ 缩量（`vol_rel_5m < 0.7`）|
+| `flat_low_dive` **平低开跳水** | `pct_vs_prev_close ≤ 0`（平/低开）+ `pct_from_open ≤ -0.01`（相对开盘再跌 ≥1%）**（状态型，非事件；无 `_age_min`）**|
 
 **量能口径**：`vol_rel_5m` = 近 5 分钟成交量 / **当日每分钟均量**（水平比，
 >1.2 放量、<0.7 缩量）。它比 `vol_ratio_5m_today`（近5分钟/前5分钟的**加速度**）
@@ -470,12 +474,22 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
     minute_feat = _latest_intraday_features(data_dir, symbols)
     snap_metrics = _snapshot_metrics(quote_frame, symbols, prev_close)
     hist: dict[str, dict[str, Any]] = {}
+    # 形态报告窗口必须与决策间隔匹配：否则把 llm_interval_seconds 调大后，
+    # 形态会在两次决策之间过期，LLM 看到 false 而静默丢信号。
+    try:
+        _interval_s = _inum(acc, "llm_interval_seconds", DEFAULT_INTERVAL_SECONDS)
+    except (TypeError, ValueError):
+        _interval_s = DEFAULT_INTERVAL_SECONDS
     try:
         from app.strategy import intraday_history
 
+        base_window = intraday_history.RECENT_WINDOW_MIN
+        pattern_window_min = max(base_window, int(_interval_s / 60) + 1)
         hist = intraday_history.derive(data_dir, symbols,
-                                      day_open=_day_open_map(quote_frame, symbols))
+                                      day_open=_day_open_map(quote_frame, symbols),
+                                      recent_window_min=pattern_window_min)
     except Exception:
+        pattern_window_min = 5          # 与 intraday_history.RECENT_WINDOW_MIN 同值
         logger.debug("intraday history derive failed", exc_info=True)
 
     feature_keys = (
@@ -508,6 +522,14 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
                 merged[age_key] = hs[age_key]
         merged["minutes_recorded"] = hs.get("minutes")
         merged["last_minute"] = hs.get("last_minute")
+        merged["pattern_window_min"] = hs.get("pattern_window_min") or pattern_window_min
+        # 平低开直接跳水（第4讲·图pg017）：平/低开 且 相对开盘再跌 ≥1%。
+        # 与 condition 路径的 hp_sell_flat_low_open_dive 同口径（小数制）。
+        _pfo, _pvc = merged.get("pct_from_open"), merged.get("pct_vs_prev_close")
+        merged["flat_low_dive"] = bool(
+            _pfo is not None and _pvc is not None
+            and float(_pvc) <= 0 and float(_pfo) <= -0.01
+        )
         if mf.get("vwap") is not None:
             merged["source"] = "minute"           # 真实分钟K
         elif hs.get("vwap") is not None:
@@ -742,8 +764,15 @@ def _execute_price_level(data_dir: Path, account_id: str, acc: dict[str, Any],
     rec["action"] = side
     if qty <= 0:
         rec["result"] = "rejected"
-        rec["error"] = (f"档位无需调仓 (目标{target}: 现价{price}, 持仓{qty_now}, "
-                        f"可卖{avail}, 现金{cash:.0f})")
+        # T+1 受阻要**显性化**：持仓明明存在、可卖却为 0（当日买入），档位命中却执行不了。
+        # 若只报"无需调仓"，用户会以为档位失效 —— 实际是次日就能执行。
+        if target in ("exit", "half") and side == "sell" and qty_now > 0 and avail <= 0:
+            rec["error"] = (f"档位命中但被 **T+1** 拦住: 持仓{qty_now}股、可卖0"
+                            f"（当日买入），次日方可执行")
+            rec["t1_blocked"] = True
+        else:
+            rec["error"] = (f"档位无需调仓 (目标{target}: 现价{price}, 持仓{qty_now}, "
+                            f"可卖{avail}, 现金{cash:.0f})")
         return rec
 
     qty = int(qty)
@@ -1066,6 +1095,9 @@ def _mark_state_after(data_dir: Path, account_id: str, rec: dict[str, Any]) -> N
     st["last_error"] = rec.get("error")
     st["last_order_id"] = rec.get("order_id")
     st["last_stop"] = rec.get("stop")
+    # 档位/兜底命中但被 T+1 拦住 —— 让 UI 能直接显示"为什么没执行"
+    st["last_t1_blocked"] = rec.get("t1_blocked")
+    st["last_degraded"] = rec.get("degraded")
     # 本次判断所用的分时快照（价格/均价线/来源）——给 UI 看「当前均价线是多少」
     if rec.get("market") is not None:
         st["last_market"] = rec.get("market")

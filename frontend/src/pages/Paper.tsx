@@ -1067,6 +1067,14 @@ function AutoRulesPanel({ acc }: { acc: string }) {
                 <span className="text-secondary">{st.last_run_at}</span>
                 {' · '}{st.last_action ?? '--'}{' · '}{st.last_result ?? '--'}
                 {st.last_stop ? <span className="text-danger">{' · 破位清仓'}</span> : null}
+                {st.last_t1_blocked ? (
+                  <span className="text-warning" title="档位/止损已命中，但当日买入的部分 T+1 不可卖，次日方可执行">
+                    {' · '}T+1受阻
+                  </span>
+                ) : null}
+                {st.last_degraded ? (
+                  <span className="text-warning/80" title={st.last_degraded}>{' · 降级执行'}</span>
+                ) : null}
                 {st.last_reason ? <>{' · '}{st.last_reason}</> : null}
                 {st.last_error ? <span className="text-danger">{' · '}{st.last_error}</span> : null}
               </>

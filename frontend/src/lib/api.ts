@@ -1246,6 +1246,10 @@ export interface PaperLlmStatus {
     last_order_id?: string
     /** 该单是否走了「破位/止损一次性清仓」通道 */
     last_stop?: boolean
+    /** 档位/兜底命中但被 T+1 拦住（当日买入，次日方可执行） */
+    last_t1_blocked?: boolean
+    /** 降级执行标记（如 vwap=null 时仍执行风险退出） */
+    last_degraded?: string
     last_market?: Record<string, { price?: number | null; vwap?: number | null; source?: string }>
     runs?: number
   }
