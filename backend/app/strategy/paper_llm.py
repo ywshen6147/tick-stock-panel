@@ -66,8 +66,25 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
   7. 硬止损：跌破当日开盘价 3%（第2讲风控：止损2-4个点）
 风控纪律：纪律 > 情绪；止损 > 扛单；胜率 > 单次暴利；没有符合条件的机会就**不交易**。
 
+## 输入字段口径（features 里每个标的最新一根已完成分钟bar）
+- `vwap`       分时均价线（黄色均价线）—— 本体系的中心基准
+- `price`      最新价（与 quotes 一致）
+- `pct_from_open`     相对**当日开盘**涨跌幅（小数：0.03 = +3%）
+- `pct_vs_prev_close` 相对**昨收**涨跌幅（小数）
+- `vol_ratio_1m_today` / `vol_ratio_3m_today` / `vol_ratio_5m_today`
+  放量比 = 最近N根量之和 / 此前N根量之和（1.0=平量，>2 明显放量，<0.5 极度缩量）
+- `day_high_dist`  距当日最高价（0 = 正处当日最高；负值 = 低于最高）
+- `day_low_dist`   距当日最低价（0 = 正处当日最低；正值 = 高于最低）
+- `open_30m_high_dist` 距开盘30分钟最高价（上穿 0 = 突破前30分钟高点）
+- `bar_time`       该特征所属分钟bar时间
+
+注意：`pct_*` 是**小数**不是百分数；`null` 表示数据不足（窗口不满/缺昨收），
+**任何字段为 null 时不要脑补数值，按"数据不足"处理**。
+
 ## 硬性要求
 - 只依据给出的数据判断，**绝不编造**行情；数据不足就输出 hold。
+- **`features[symbol].vwap` 为 null 时，禁止输出 buy/sell，只能 hold** ——
+  均价线缺失时本方法论的所有买卖点都不成立。
 - 输出必须是**严格 JSON**，不要任何解释性文字、不要 markdown 代码块。
 - 只能在给定标的列表内交易。
 - 不能替用户承诺收益，不能预测必然涨跌。
@@ -157,6 +174,87 @@ def resolve_symbols(data_dir: Path, account_id: str, acc: dict[str, Any]) -> lis
     return seen
 
 
+# ── 分时特征取数（LLM 判断的必需输入） ───────────────────────────
+def _prev_close_map(data_dir: Path, symbols: list[str]) -> dict[str, float]:
+    """取各标的"上一交易日"收盘价（用于 pct_vs_prev_close）。
+
+    从 kline_daily/date=<d>/part.parquet 分区里，取日期 < 今日的最近一个分区。
+    """
+    import polars as pl
+
+    out: dict[str, float] = {}
+    try:
+        root = data_dir / "kline_daily"
+        today = cn_today().isoformat()
+        parts = sorted(p.name.split("=", 1)[1] for p in root.glob("date=*") if p.name.split("=", 1)[1] < today)
+        if not parts:
+            return out
+        f = root / f"date={parts[-1]}" / "part.parquet"
+        if not f.exists():
+            return out
+        df = pl.read_parquet(f, columns=["symbol", "close"])
+        df = df.filter(pl.col("symbol").cast(pl.Utf8).is_in(symbols))
+        for r in df.to_dicts():
+            try:
+                out[str(r["symbol"])] = float(r["close"])
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        logger.debug("prev_close map failed", exc_info=True)
+    return out
+
+
+def _latest_intraday_features(data_dir: Path, symbols: list[str]) -> dict[str, dict[str, Any]]:
+    """用本地分钟K算出每个标的**最新一根已完成bar**的分时特征。
+
+    复用 intraday_features.build_feature_frame（与分时信号/回测同口径），
+    产出 vwap / pct_from_open / pct_vs_prev_close / vol_ratio_* / day_high_dist 等 ——
+    这些正是《海平分时擒牛》判断买卖点的必需字段。
+
+    数据不足（无分钟分区、标的缺失、窗口不满）时该字段为 None，调用方据此 fail-closed。
+    """
+    import polars as pl
+
+    from app.strategy.intraday_features import INTRADAY_FEATURES, build_feature_frame
+
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        root = data_dir / "kline_minute"
+        parts = sorted(root.glob("date=*"))
+        if not parts:
+            return out
+        today_dir = root / f"date={cn_today().isoformat()}"
+        pdir = today_dir if today_dir.exists() else parts[-1]
+        f = pdir / "part.parquet"
+        if not f.exists():
+            return out
+
+        df = pl.read_parquet(f)
+        if "symbol" not in df.columns:
+            return out
+        df = df.filter(pl.col("symbol").cast(pl.Utf8).is_in(symbols))
+        if df.is_empty():
+            return out
+
+        frame = build_feature_frame(df, prev_close=_prev_close_map(data_dir, symbols), cutoff=cn_now())
+        if frame.is_empty():
+            return out
+        for sym in symbols:
+            sub = frame.filter(pl.col("symbol") == sym)
+            if sub.is_empty():
+                continue
+            row = sub.sort("datetime").tail(1).to_dicts()[0]
+            vals: dict[str, Any] = {}
+            for k in INTRADAY_FEATURES:
+                v = row.get(k)
+                vals[k] = None if v is None else round(float(v), 4)
+            vals["bar_time"] = str(row.get("datetime"))
+            out[sym] = vals
+    except Exception:
+        logger.debug("intraday features build failed", exc_info=True)
+    return out
+
+
 # ── 上下文构建 ──────────────────────────────────────────────────
 def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
                    snapshot: dict[str, float], symbols: list[str]) -> dict[str, Any]:
@@ -190,6 +288,9 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
         if p:
             quotes[s] = round(float(p), 4)
 
+    # 分时特征（vwap/量比/涨跌幅/当日高低…）—— 海平方法论判断的必需输入
+    features = _latest_intraday_features(data_dir, symbols)
+
     return {
         "time": cn_now().strftime("%Y-%m-%d %H:%M:%S"),
         "account": {"id": account_id, "cash": acc.get("cash"), "status": acc.get("status")},
@@ -199,6 +300,7 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
         "max_order_amount": _fnum(acc, "llm_max_order_amount", DEFAULT_MAX_ORDER_AMOUNT),
         "max_daily_amount": _fnum(acc, "llm_max_daily_amount", DEFAULT_MAX_DAILY_AMOUNT),
         "quotes": quotes,
+        "features": features,
         "symbols": symbols,
     }
 
@@ -254,17 +356,28 @@ async def _decide(ctx: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
         {"role": "user", "content": user},
     ]
     try:
+        # 不显式传 temperature / max_tokens:
+        #   - 部分模型只接受 temperature=1 (传具体值会 400, 只能靠 provider 重试剥掉,
+        #     白跑一轮请求), 故直接不传;
+        #   - 推理型模型(如 kimi-k2.7-code / deepseek reasoner)的**思考 token 计入
+        #     max_tokens 预算**, 显式限制(如 800)会把正文吃光 → 返回空串,
+        #     表现为"模型没输出"。交给服务端默认上限最稳。
         text = await ai_provider.generate_ai_text(
-            messages, temperature=0.2, max_tokens=800, timeout=120.0,
+            messages, temperature=None, max_tokens=None, timeout=180.0,
         )
     except Exception as e:  # noqa: BLE001
         return None, f"LLM 调用失败: {e}"
+    if not (text or "").strip():
+        # 空响应常见于：推理预算被思考吃光、上游限流、内容被过滤。
+        # 明确回传原因，避免在决策流水里只看到"未得到有效 JSON"而无从排查。
+        return None, "LLM 返回空响应（可能是推理预算/限流/内容过滤）"
     return _extract_json(text), text
 
 
 def _execute(data_dir: Path, account_id: str, acc: dict[str, Any], decision: dict[str, Any],
              snapshot: dict[str, float], symbols: list[str],
-             buy_amount_today: float) -> dict[str, Any]:
+             buy_amount_today: float,
+             features: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """校验决策并下单。返回记录（含 action/order_id/rejected 原因）。"""
     action = str(decision.get("action") or "").strip().lower()
     sym = str(decision.get("symbol") or "").strip()
@@ -289,6 +402,14 @@ def _execute(data_dir: Path, account_id: str, acc: dict[str, Any], decision: dic
         return rec
     if not sym or sym not in symbols:
         rec["result"] = "rejected"; rec["error"] = f"标的不在允许列表: {sym!r}"
+        return rec
+
+    # 硬护栏: 分时均价线缺失 → 海平方法论的所有买卖点都不成立, 一律拒绝下单。
+    # (提示词已要求模型这么做, 这里再兜一层, 防止模型在数据缺失时凭想象下单。)
+    feat = (features or {}).get(sym) or {}
+    if feat.get("vwap") is None:
+        rec["result"] = "rejected"
+        rec["error"] = "分时均价线缺失(vwap=null), 方法论条件不成立, 拒绝下单"
         return rec
 
     price = float(snapshot.get(sym) or 0)
@@ -348,7 +469,8 @@ async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float])
         return rec
 
     rec = _execute(data_dir, account_id, acc, decision, snapshot, symbols,
-                   ctx.get("buy_amount_today_est") or 0.0)
+                   ctx.get("buy_amount_today_est") or 0.0,
+                   features=ctx.get("features") or {})
     _append_decision(data_dir, account_id, rec)
     logger.info("llm auto %s: action=%s result=%s %s", account_id, rec.get("action"),
                 rec.get("result"), rec.get("error") or rec.get("order_id") or "")
