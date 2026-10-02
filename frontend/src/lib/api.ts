@@ -1226,7 +1226,20 @@ export interface PaperLlmStatus {
   max_order_amount: number
   max_daily_amount: number
   symbols: string[]
-  state: Record<string, unknown>
+  /** 最近一次决策的状态（含最近分时快照 last_market：价格/均价线/数据源） */
+  state: {
+    last_run_at?: string
+    last_action?: string
+    last_result?: string
+    last_reason?: string
+    last_basis?: string
+    last_error?: string
+    last_order_id?: string
+    /** 该单是否走了「破位/止损一次性清仓」通道 */
+    last_stop?: boolean
+    last_market?: Record<string, { price?: number | null; vwap?: number | null; source?: string }>
+    runs?: number
+  }
 }
 
 export interface PaperAccountSummary {

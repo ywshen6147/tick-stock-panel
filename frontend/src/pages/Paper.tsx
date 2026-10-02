@@ -921,7 +921,7 @@ function AutoRulesPanel({ acc }: { acc: string }) {
     return <AutoRuleForm acc={acc} onDone={() => { setCreating(false); invalidate() }} onCancel={() => setCreating(false)} />
   }
 
-  const st = (llm?.state ?? {}) as Record<string, unknown>
+  const st = llm?.state ?? {}
   const inputCls = 'w-full rounded-btn border border-border bg-elevated px-2 py-1 text-xs text-secondary outline-none focus:border-accent'
 
   return (
@@ -1003,13 +1003,28 @@ function AutoRulesPanel({ acc }: { acc: string }) {
           <div className="rounded-btn bg-elevated/50 px-2 py-1.5 text-[11px] text-muted">
             上次决策: {st.last_run_at ? (
               <>
-                <span className="text-secondary">{String(st.last_run_at)}</span>
-                {' · '}{String(st.last_action ?? '--')}{' · '}{String(st.last_result ?? '--')}
-                {st.last_reason ? <>{' · '}{String(st.last_reason)}</> : null}
-                {st.last_error ? <span className="text-danger">{' · '}{String(st.last_error)}</span> : null}
+                <span className="text-secondary">{st.last_run_at}</span>
+                {' · '}{st.last_action ?? '--'}{' · '}{st.last_result ?? '--'}
+                {st.last_stop ? <span className="text-danger">{' · 破位清仓'}</span> : null}
+                {st.last_reason ? <>{' · '}{st.last_reason}</> : null}
+                {st.last_error ? <span className="text-danger">{' · '}{st.last_error}</span> : null}
               </>
             ) : '暂无 (盘中每 N 秒自动判断一次)'}
           </div>
+          {/* 最近一次判断所用的分时快照 —— 直接看「当前分时均价线是多少、来自哪种源」 */}
+          {st.last_market && Object.keys(st.last_market).length > 0 && (
+            <div className="rounded-btn bg-elevated/50 px-2 py-1.5 text-[11px] text-muted">
+              分时均价线:
+              {Object.entries(st.last_market).map(([sym, m]) => (
+                <span key={sym} className="ml-2">
+                  <span className="font-mono text-secondary">{sym}</span>
+                  {' 现价 '}<span className="font-mono">{m?.price ?? '--'}</span>
+                  {' · 均价 '}<span className="font-mono text-accent">{m?.vwap ?? 'null'}</span>
+                  <span className="ml-1 text-[10px] text-muted/70">({m?.source ?? '-'})</span>
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       ) : (
         <>

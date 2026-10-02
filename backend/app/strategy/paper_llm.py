@@ -102,8 +102,16 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
 
 ## 输出格式（严格 JSON）
 {"action":"buy"|"sell"|"hold","symbol":"<代码或空>","amount":<正整数或0>,
- "reason":"<30字以内中文理由>","basis":"<方法论依据，如 第2讲·图pg005>"}
+ "stop":<true|false>,"reason":"<30字以内中文理由>","basis":"<方法论依据，如 第2讲·图pg005>"}
+
 - hold 时 symbol 可为空字符串、amount 为 0。
+- **`stop` 只在「卖出且属于破位/止损」时置 `true`**，即满足以下之一：
+  ① 跌破分时均价线（标准 S 点）；② 硬止损（跌破当日开盘价 3%）。
+  置 true 时系统会**按可卖持仓一次性清仓**（不受单笔 10 万限制）—— 因为
+  「破位就走、不扛单」必须一次执行完，分批在急跌里卖不干净。
+- 其他卖点（无量拉升诱多、量价背离、高开震荡缩量、平低开跳水）属**常规减仓**：
+  `stop` 填 `false`，按 `amount`（≤单笔上限）分批卖出。
+- 买入时 `stop` 一律 `false`。
 """
 
 
@@ -521,6 +529,44 @@ def _execute(data_dir: Path, account_id: str, acc: dict[str, Any], decision: dic
         rec["result"] = "rejected"; rec["error"] = "无有效现价"
         return rec
 
+    # ── 止损/破位清仓通道 ─────────────────────────────────────
+    # 「破位就走、不扛单」要求一次执行完；分批(每单10万)在急跌里卖不干净。
+    # 当模型标记 stop=true（跌破分时均价线S点 / 硬止损跌破开盘3%）时，
+    # 改为**按可卖持仓全额卖出**，不再走金额分批；仍受 T+1 可卖与超卖防护约束。
+    is_stop = bool(decision.get("stop"))
+    if action == "sell" and is_stop:
+        pos = {}
+        try:
+            pos = (paper.load_positions(data_dir, account_id) or {}).get(sym) or {}
+        except Exception:
+            pos = {}
+        # 注意: 物化文件 positions.json 里的 available_qty 是上次重建时的 T+1 口径,
+        # 跨日不更新(次日仍为 0)。必须与 paper.create_order 同口径**现算**
+        # (_available_of(pos, 今日) = buy_date < 今日 的批次之和), 否则清仓恒被拒。
+        try:
+            avail = int(paper._available_of(pos, cn_today().isoformat())) if pos else 0
+        except Exception:
+            avail = 0
+        qty = (avail // 100) * 100          # 按手取整
+        if qty <= 0:
+            rec["result"] = "rejected"
+            rec["error"] = f"止损清仓被拒: 无可用持仓 (available={avail}, T+1)"
+            return rec
+        rec["stop"] = True
+        rec["qty"] = qty
+        rec["amount"] = round(qty * price, 2)
+        order, err = paper.create_order(
+            data_dir, sym, "sell", account_id=account_id,
+            qty=qty, order_type="market", ref_price=price,
+            source=f"llm:{cn_today().isoformat()}",
+        )
+        if err:
+            rec["result"] = "rejected"; rec["error"] = err
+        else:
+            rec["result"] = "ordered"; rec["order_id"] = order.get("id")
+            rec["qty"] = order.get("qty"); rec["price"] = price
+        return rec
+
     max_order = _fnum(acc, "llm_max_order_amount", DEFAULT_MAX_ORDER_AMOUNT)
     if amount <= 0:
         amount = max_order
@@ -566,16 +612,29 @@ async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float],
         return rec
 
     ctx = _build_context(data_dir, account_id, acc, snapshot, symbols, quote_frame=quote_frame)
+    # 把本次判断所用的分时快照（尤其 vwap）带进记录与状态，供 UI 直观查看
+    # 「当前分时均价线是多少、来自哪种数据源」。
+    feats = ctx.get("features") or {}
+    market = {
+        s: {
+            "price": (feats.get(s) or {}).get("price"),
+            "vwap": (feats.get(s) or {}).get("vwap"),
+            "source": (feats.get(s) or {}).get("source"),
+        }
+        for s in symbols
+    }
     decision, raw = await _decide(ctx)
     if decision is None:
         rec = {"ts": cn_now().isoformat(timespec="seconds"), "account": account_id,
-               "action": "hold", "result": "rejected", "error": f"未得到有效 JSON: {str(raw)[:200]}"}
+               "action": "hold", "result": "rejected",
+               "error": f"未得到有效 JSON: {str(raw)[:200]}", "market": market}
         _append_decision(data_dir, account_id, rec)
         return rec
 
     rec = _execute(data_dir, account_id, acc, decision, snapshot, symbols,
                    ctx.get("buy_amount_today_est") or 0.0,
-                   features=ctx.get("features") or {})
+                   features=feats)
+    rec["market"] = market
     _append_decision(data_dir, account_id, rec)
     if rec.get("result") == "ordered":
         _emit_order_alert(data_dir, account_id, rec)
@@ -628,6 +687,10 @@ def _mark_state_after(data_dir: Path, account_id: str, rec: dict[str, Any]) -> N
     st["last_basis"] = rec.get("basis")
     st["last_error"] = rec.get("error")
     st["last_order_id"] = rec.get("order_id")
+    st["last_stop"] = rec.get("stop")
+    # 本次判断所用的分时快照（价格/均价线/来源）——给 UI 看「当前均价线是多少」
+    if rec.get("market") is not None:
+        st["last_market"] = rec.get("market")
     st["runs"] = int(st.get("runs") or 0) + 1
     save_state(data_dir, account_id, st)
 
