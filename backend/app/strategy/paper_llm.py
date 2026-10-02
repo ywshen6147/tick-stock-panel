@@ -220,11 +220,11 @@ def _latest_intraday_features(data_dir: Path, symbols: list[str]) -> dict[str, d
     out: dict[str, dict[str, Any]] = {}
     try:
         root = data_dir / "kline_minute"
-        parts = sorted(root.glob("date=*"))
-        if not parts:
+        # 只认**当日**分区: 分时均价线跨日毫无意义, 用历史分区的 vwap 判断今天的交易
+        # 比没有数据更危险(会把旧日形态当成当前)。缺失即返回空 → 上层 fail-closed。
+        pdir = root / f"date={cn_today().isoformat()}"
+        if not pdir.exists():
             return out
-        today_dir = root / f"date={cn_today().isoformat()}"
-        pdir = today_dir if today_dir.exists() else parts[-1]
         f = pdir / "part.parquet"
         if not f.exists():
             return out
