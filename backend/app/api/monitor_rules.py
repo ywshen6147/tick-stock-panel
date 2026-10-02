@@ -126,7 +126,7 @@ def get_options(request: Request):
     """返回可选字段、信号列、运算符、枚举,供前端表单使用。"""
     from app.indicators.pipeline import ENRICHED_COLUMNS
     from app.services.kline_sync import intraday_monitor_support
-    from app.strategy.custom_signals import ALLOWED_FIELDS, load_all as load_csg
+    from app.strategy.custom_signals import ALLOWED_FIELDS, INTRADAY_PREFIX, load_all as load_csg
 
     # 阈值字段 (带中文标签)
     threshold_fields = [
@@ -143,13 +143,15 @@ def get_options(request: Request):
         {"key": key, "label": label}
         for key, label in INTRADAY_SIGNAL_LABELS.items()
     )
-    # 自定义信号列 (csg_)
+    # 自定义信号列: 日线 csg_ / 盘中 csgi_ (按信号 timeframe 取正确前缀)
     custom_sigs = []
     try:
         for cs in load_csg(_data_dir(request)):
             if cs.get("enabled") is not False:
+                is_intraday = str(cs.get("timeframe") or "").strip().lower() == "intraday"
+                prefix = INTRADAY_PREFIX if is_intraday else "csg_"
                 custom_sigs.append({
-                    "key": f"csg_{cs['id']}",
+                    "key": f"{prefix}{cs['id']}",
                     "label": cs.get("name", cs["id"]),
                 })
     except Exception:

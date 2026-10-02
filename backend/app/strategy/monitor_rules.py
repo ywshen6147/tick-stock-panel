@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from app.services.fs_utils import atomic_write_text
-from app.strategy.custom_signals import ALLOWED_FIELDS
+from app.strategy.custom_signals import ALLOWED_FIELDS, INTRADAY_PREFIX
 from app.strategy.intraday_signals import uses_intraday_signals
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,9 @@ VD_BASIC_FILTER_DEFAULTS: dict = {
 }
 
 # 布尔信号列前缀 (op=truth 时 field 取这些)
-_SIGNAL_PREFIXES = ("signal_", "csg_")
+# csgi_ 为自定义「盘中」信号列 (见 custom_signals.INTRADAY_PREFIX), 与 csg_ 同族;
+# 引擎 (intraday_signals/engine/monitor) 早已支持, 校验白名单此前漏了它。
+_SIGNAL_PREFIXES = ("signal_", "csg_", INTRADAY_PREFIX)
 
 
 # ── 持久化 (镜像 custom_signals.py) ─────────────────────
@@ -282,9 +284,9 @@ def validate(rule: dict) -> None:
             field = c.get("field", "")
             op = c.get("op", "")
             if op == "truth":
-                # 布尔信号: field 必须是 signal_/csg_ 前缀
+                # 布尔信号: field 必须是 signal_/csg_(日线自定义)/csgi_(盘中自定义) 前缀
                 if not _is_signal_field(field):
-                    raise ValueError(f"第 {i+1} 个条件: op=truth 时 field 必须是信号列 (signal_/csg_ 前缀): {field!r}")
+                    raise ValueError(f"第 {i+1} 个条件: op=truth 时 field 必须是信号列 (signal_/csg_/csgi_ 前缀): {field!r}")
             elif op in OPS:
                 # 阈值比较: field 必须在白名单, 需要 value
                 if field not in ALLOWED_FIELDS:
