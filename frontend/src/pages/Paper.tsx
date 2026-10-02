@@ -37,6 +37,33 @@ function fmtMoney(v: number | null | undefined, digits = 2) {
   return Number(v).toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits })
 }
 
+/** 订单来源徽标: 手动 / 条件跟单 / LLM跟单 (后端 source: manual | auto:<ruleId> | llm:<日期>) */
+function OrderSourceBadge({ source }: { source?: string }) {
+  const s = source ?? 'manual'
+  if (s.startsWith('auto:')) {
+    return (
+      <span className="w-10 shrink-0 rounded-full bg-accent/10 px-1.5 py-px text-center text-[10px] leading-4 text-accent"
+        title={`条件跟单 · 规则 ${s.slice(5)}`}>
+        条件
+      </span>
+    )
+  }
+  if (s.startsWith('llm:')) {
+    return (
+      <span className="w-10 shrink-0 rounded-full bg-warning/10 px-1.5 py-px text-center text-[10px] leading-4 text-warning"
+        title={`LLM跟单 · ${s.slice(4)}`}>
+        LLM
+      </span>
+    )
+  }
+  return (
+    <span className="w-10 shrink-0 rounded-full bg-elevated px-1.5 py-px text-center text-[10px] leading-4 text-muted"
+      title="手动下单">
+      手动
+    </span>
+  )
+}
+
 /** 账户 id: 字母数字开头短横线/下划线, 与后端校验一致 */
 function genAccountId() {
   return `acc_${Date.now().toString(36)}${Math.floor(Math.random() * 36).toString(36)}`
@@ -1461,6 +1488,7 @@ export function Paper() {
                       <span className="w-24 shrink-0 font-mono">{o.symbol}</span>
                       <span className="w-16 shrink-0 font-mono text-right">{o.qty}</span>
                       <span className="w-16 shrink-0 text-muted">{ORDER_TYPE_LABEL[o.order_type]}</span>
+                      <OrderSourceBadge source={o.source} />
                       <span className={cn(
                         'w-16 shrink-0 rounded-full px-1.5 py-px text-center text-[10px] leading-4',
                         o.status === 'filled' ? 'bg-bear/10 text-bear'

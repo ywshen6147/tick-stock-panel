@@ -577,9 +577,45 @@ async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float],
                    ctx.get("buy_amount_today_est") or 0.0,
                    features=ctx.get("features") or {})
     _append_decision(data_dir, account_id, rec)
+    if rec.get("result") == "ordered":
+        _emit_order_alert(data_dir, account_id, rec)
     logger.info("llm auto %s: action=%s result=%s %s", account_id, rec.get("action"),
                 rec.get("result"), rec.get("error") or rec.get("order_id") or "")
     return rec
+
+
+def _emit_order_alert(data_dir: Path, account_id: str, rec: dict[str, Any]) -> None:
+    """把 LLM 下单推入告警流（落盘 alerts.jsonl + SSE 实时广播）。
+
+    条件跟单的订单经 `paper_auto.auto_order_events` 由 quote_service 推送；
+    LLM 跟单跑在独立线程里，若不自报就会「静默成交」——用户只能在订单列表里
+    事后发现。这里补上同构事件，让它在监控中心触发记录与实时通知中可见，
+    并把模型给的理由/依据一起带上（便于复盘为什么这么下单）。
+    """
+    try:
+        from app.services import alert_store
+
+        side_label = "买入" if rec.get("action") == "buy" else "卖出"
+        msg = f"LLM跟单触发{side_label}下单 {rec.get('qty')}股 @ {rec.get('price')}"
+        if rec.get("reason"):
+            msg += f" · {rec['reason']}"
+        alert_store.append_many(data_dir, [{
+            "source": "paper",
+            "type": "auto_order",
+            "severity": "info",
+            "ts": int(cn_now().timestamp() * 1000),
+            "symbol": rec.get("symbol"),
+            "account_id": account_id,
+            "side": rec.get("action"),
+            "qty": rec.get("qty"),
+            "order_id": rec.get("order_id"),
+            "mode": "llm",
+            "reason": rec.get("reason"),
+            "basis": rec.get("basis"),
+            "message": msg,
+        }])
+    except Exception:
+        logger.debug("llm order alert emit failed", exc_info=True)
 
 
 def _mark_state_after(data_dir: Path, account_id: str, rec: dict[str, Any]) -> None:
