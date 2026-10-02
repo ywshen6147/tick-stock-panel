@@ -47,6 +47,9 @@ DEFAULT_MAX_ORDER_AMOUNT = 100_000.0
 DEFAULT_MAX_DAILY_AMOUNT = 200_000.0
 # 卖出日上限: 只约束"常规减仓"; 破位/止损清仓与价格档位清仓**豁免**(否则止损被卡住)
 DEFAULT_MAX_DAILY_SELL_AMOUNT = 200_000.0
+# 硬止损: 相对当日开盘跌幅达到该比例 → **由代码直接清仓**（不依赖模型自报 stop）。
+# 对应方法论「止损 2-4 个点」的中间值。
+STOP_LOSS_PCT = 0.03
 # 档位键 → 中文标签（用于决策记录与告警文案）
 PRICE_LEVEL_LABELS = {
     "exit_all": "清仓价",
@@ -761,6 +764,51 @@ def _execute_price_level(data_dir: Path, account_id: str, acc: dict[str, Any],
     return rec
 
 
+def _stop_backstop(acc: dict[str, Any], ctx: dict[str, Any], symbols: list[str],
+                   down_cross: dict[str, bool]) -> dict[str, Any] | None:
+    """**确定性止损兜底**（优先级：价格档位 > 本兜底 > LLM 判断）。
+
+    为什么需要: `stop` 原先只有一个来源 —— 模型自报（`decision.get("stop")`）。而
+    「跌破分时均价线（S点）」与「硬止损（跌破开盘 3%）」恰好是方法论里**最不能失效**
+    的两条纪律，却成了唯一没有确定性实现的条件：模型漏报 `stop` 时，"破位就走"
+    会退化成 10 万/20 万**分批卖出**，急跌里根本卖不干净。这里用代码复算这两条。
+
+      - **硬止损**：`pct_from_open ≤ -STOP_LOSS_PCT` —— 不需要 vwap，
+        因此数据源故障（vwap=null）时**仍然可用**。
+      - **破位**：本分钟刚下穿分时均价线（由自建分钟序列判定）。
+
+    只在「有持仓 + 有可卖数量 + 当日无 pending 卖单」时返回动作：
+    T+1 无可卖时交给正常路径去记录（避免这里每 5 分钟重复尝试）；
+    已有 pending 卖单则跳过（平台的超卖防护也会拦，这里少一次噪声）。
+    """
+    feats = ctx.get("features") or {}
+    positions = ctx.get("positions") or {}
+    orders_today = ctx.get("orders_today") or []
+    for sym in symbols:
+        pos = positions.get(sym) or {}
+        if int(pos.get("qty") or 0) <= 0:
+            continue
+        if int(pos.get("available_qty") or 0) <= 0:
+            continue
+        if any(str(o.get("symbol")) == sym and o.get("side") == "sell"
+               and o.get("status") == "pending" for o in orders_today):
+            continue
+        f = feats.get(sym) or {}
+        try:
+            pct = float(f.get("pct_from_open")) if f.get("pct_from_open") is not None else None
+        except (TypeError, ValueError):
+            pct = None
+        reason = None
+        if pct is not None and pct <= -STOP_LOSS_PCT:
+            reason = f"硬止损(代码兜底): 相对开盘 {pct:.2%} ≤ -{STOP_LOSS_PCT:.0%}"
+        elif down_cross.get(sym):
+            reason = "破位(代码兜底): 本分钟下穿分时均价线(S点)"
+        if reason:
+            return {"action": "sell", "symbol": sym, "target": "exit", "stop": True,
+                    "reason": reason, "basis": "代码兜底·硬止损/跌破均价线S点"}
+    return None
+
+
 def _execute(data_dir: Path, account_id: str, acc: dict[str, Any], decision: dict[str, Any],
              snapshot: dict[str, float], symbols: list[str],
              buy_amount_today: float,
@@ -792,13 +840,17 @@ def _execute(data_dir: Path, account_id: str, acc: dict[str, Any], decision: dic
         rec["result"] = "rejected"; rec["error"] = f"标的不在允许列表: {sym!r}"
         return rec
 
-    # 硬护栏: 分时均价线缺失 → 海平方法论的所有买卖点都不成立, 一律拒绝下单。
-    # (提示词已要求模型这么做, 这里再兜一层, 防止模型在数据缺失时凭想象下单。)
+    # 硬护栏: 分时均价线缺失 → 方法论条件不成立, 拒绝下单。
+    # **但风险退出例外**: stop=true 的清仓必须放行 —— 数据源故障时, 最该执行的
+    # 减仓动作不该被"数据缺失"反过来拦住(U8)。买入与常规卖出仍一律拒绝。
     feat = (features or {}).get(sym) or {}
-    if feat.get("vwap") is None:
+    is_risk_exit = action == "sell" and bool(decision.get("stop"))
+    if feat.get("vwap") is None and not is_risk_exit:
         rec["result"] = "rejected"
         rec["error"] = "分时均价线缺失(vwap=null), 方法论条件不成立, 拒绝下单"
         return rec
+    if feat.get("vwap") is None and is_risk_exit:
+        rec["degraded"] = "vwap=null 仍执行风险退出"
 
     price = float(snapshot.get(sym) or 0)
     if price <= 0:
@@ -924,6 +976,28 @@ async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float],
             _emit_order_alert(data_dir, account_id, rec)
         logger.info("llm auto %s: price-level %s result=%s qty=%s", account_id,
                     lvl.get("target"), rec.get("result"), rec.get("qty"))
+        return rec
+
+    # ── 止损兜底（价格档位已处理则不会走到这里）─────────────────
+    # 硬止损 / 下穿均价线 由代码判定并直接清仓, 不再只依赖模型自报 stop。
+    try:
+        from app.strategy import intraday_history
+
+        down_cross = intraday_history.crossed_below_vwap(data_dir, symbols)
+    except Exception:
+        logger.debug("stop backstop: down-cross probe failed", exc_info=True)
+        down_cross = {}
+    stop_act = _stop_backstop(acc, ctx, symbols, down_cross)
+    if stop_act is not None:
+        rec = _execute_price_level(data_dir, account_id, acc, stop_act, ctx)
+        rec["market"] = market
+        rec["trigger"] = "stop_backstop"
+        _append_decision(data_dir, account_id, rec)
+        if rec.get("result") == "ordered":
+            _emit_order_alert(data_dir, account_id, rec)
+        logger.info("llm auto %s: stop-backstop %s result=%s qty=%s (%s)", account_id,
+                    stop_act.get("symbol"), rec.get("result"), rec.get("qty"),
+                    stop_act.get("reason"))
         return rec
 
     decision, raw = await _decide(ctx)

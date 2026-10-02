@@ -283,8 +283,49 @@ def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fiel
             if not (lo <= v <= hi):
                 raise ValueError(f"{key} 超出合理范围 ({lo}~{hi})")
             acc[key] = int(v) if key == "llm_interval_seconds" else v
+        # 价格档位**有序性**校验: 只在本次确实改了档位时做（避免历史遗留的
+        # 不一致配置把无关的设置更新也一并拒掉）。
+        if any(k in fields and fields[k] is not None for k, _ in _PRICE_LEVEL_ORDER):
+            _validate_price_levels(acc)
         save_account(data_dir, acc, account_id)
         return acc
+
+
+# 价格档位: (字段, 中文名)，顺序即**要求的递增顺序**
+_PRICE_LEVEL_ORDER: tuple[tuple[str, str], ...] = (
+    ("llm_price_exit_all", "清仓价"),
+    ("llm_price_reduce_half", "减半仓价"),
+    ("llm_price_add_half", "加半仓价"),
+    ("llm_price_full", "满仓价"),
+)
+
+
+def _validate_price_levels(acc: dict) -> None:
+    """校验价格档位满足 清仓价 < 减半仓价 < 加半仓价 < 满仓价（只比较启用项）。
+
+    为什么必须校验: 档位命中即**确定性执行**，且优先级固定为
+    清仓 > 减半 > 满仓 > 加半。若把"加半仓价"填得高于"减半仓价"，同一个现价会
+    同时满足两侧，优先级会选**减半仓** —— 也就是在你写"加仓"的位置上卖出，
+    而且不报错、不告警（订单来源同样是 LLM）。这类静默反向操作必须在入口拦掉。
+    """
+    labels = dict(_PRICE_LEVEL_ORDER)
+    enabled: list[tuple[str, float]] = []
+    for key, _ in _PRICE_LEVEL_ORDER:
+        try:
+            v = float(acc.get(key) or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0:
+            enabled.append((key, v))
+    for i in range(len(enabled) - 1):
+        k1, v1 = enabled[i]
+        k2, v2 = enabled[i + 1]
+        if not (v1 < v2):
+            raise ValueError(
+                f"价格档位必须满足 清仓价 < 减半仓价 < 加半仓价 < 满仓价；"
+                f"当前 {labels[k1]}({v1:g}) ≥ {labels[k2]}({v2:g})。"
+                f"（否则同一现价会同时满足两个档位，按固定优先级可能做出与意图相反的操作）"
+            )
 
 
 # ── 费用 (纯函数) ───────────────────────────────────────

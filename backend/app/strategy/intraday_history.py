@@ -407,6 +407,31 @@ def _pattern_ages(rows: list[dict[str, Any]]) -> dict[str, int | None]:
     return {k: (n - 1 - v[-1]) if v else None for k, v in hits.items()}
 
 
+def crossed_below_vwap(data_dir: Path, symbols: list[str],
+                       now: datetime | None = None) -> dict[str, bool]:
+    """各标的「本分钟刚下穿分时均价线」（跌破均价线 S 点）。
+
+    用自建分钟序列的**上一分钟**判定交叉：上一分钟 价 ≥ 均价线，本分钟 价 < 均价线。
+    供 `paper_llm` 的确定性止损兜底使用（不再只依赖模型自报 `stop`）。
+    无历史 / 分钟数不足 / 缺值 → 该标的为 False（调用方据此不触发）。
+    """
+    data = load(data_dir, (now or cn_now()).strftime("%Y-%m-%d"))
+    syms = data.get("symbols") or {}
+    out: dict[str, bool] = {}
+    for sym in symbols:
+        minutes: dict[str, dict[str, Any]] = ((syms.get(sym) or {}).get("m")) or {}
+        order = sorted(minutes.keys())
+        if len(order) < 2:
+            continue
+        rows = _per_minute(minutes, order, None)
+        cur, prev = rows[-1], rows[-2]
+        px, vw = cur.get("price"), cur.get("vwap")
+        ppx, pvw = prev.get("price"), prev.get("vwap")
+        if px and vw and ppx and pvw:
+            out[sym] = bool(px < vw and ppx >= pvw)
+    return out
+
+
 def daily_pattern_events(data_dir: Path, day: str, symbols: list[str],
                          day_open: dict[str, float] | None = None) -> dict[str, list[str]]:
     """重算某日各形态的**全部触发时刻**（HH:MM 列表），用于「形态触发统计」。
