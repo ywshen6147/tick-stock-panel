@@ -202,16 +202,84 @@ async function opAdj(sdk, job) {
   return out
 }
 
+/**
+ * 新浪分钟K兜底。
+ *
+ * 背景: 分钟K 走 stock-sdk 的 cnMinute(东财 push2his)。本机到东财的 HTTPS 会陷入
+ * TLS 重协商并 "server closed abruptly"（实测 curl/schannel 与 node fetch 均失败），
+ * 导致 get_minute 恒返回 0 行 —— 分钟K 完全无法同步（分时图/分时信号/分钟回测皆受影响）。
+ *
+ * 新浪 getKLineData 可达且返回真实 OHLCV，作为兜底：
+ *   - scale 取 period(1/5/15/30/60)，datalen 上限 1023 根（约 4~5 个交易日）
+ *   - volume 上游单位是**股**，而内部统一用**手**（与东财口径一致）→ 除以 100
+ *   - 输出 date 字段("YYYY-MM-DD HH:MM") 走 _minute_df 的 date 分支，避免时区换算
+ */
+async function fetchSinaMinute(appSymbol, period) {
+  const scale = String(period || 5)
+  const code = toTencentCode(appSymbol)
+  if (!code) return []
+  const url =
+    'https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData' +
+    `?symbol=${code}&scale=${scale}&ma=no&datalen=1023`
+  const resp = await fetch(url, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      Referer: 'https://finance.sina.com.cn/',
+    },
+  })
+  if (!resp.ok) return []
+  const arr = await resp.json()
+  if (!Array.isArray(arr)) return []
+  return arr
+    .map((r) => ({
+      date: String(r.day || '').slice(0, 16), // "2026-09-30 14:54"
+      open: Number(r.open),
+      high: Number(r.high),
+      low: Number(r.low),
+      close: Number(r.close),
+      volume: Number(r.volume) / 100, // 股 → 手
+      amount: Number(r.amount),
+    }))
+    .filter((r) => r.date && Number.isFinite(r.close))
+}
+
 async function opMinute(sdk, job) {
   const { symbols = [], period = 5, start, end, concurrency = 6 } = job
+  // 兜底源(新浪)不支持区间参数, 只会返回"最近 1023 根"。而 get_minute 会把请求
+  // 拆成多个时间窗(1 个头窗 + 最近几天逐日窗)逐窗调用 —— 若不按窗口过滤, 同一批
+  // 数据会被每个窗口各写一次, 造成**每分钟重复 5 行**的脏数据(实测踩过)。
+  const inWindow = (dateStr) => {
+    const d = String(dateStr).slice(0, 10).replace(/-/g, '')
+    if (start && d < String(start)) return false
+    if (end && d > String(end)) return false
+    return true
+  }
   const out = {}
   await mapPool(symbols, concurrency, async (sym) => {
-    const opts = { period: String(period) }
-    if (start) opts.startDate = start
-    if (end) opts.endDate = end
-    const bars = await fetchWithRetry(() => sdk.kline.cnMinute(sym, opts))
-    out[sym] = Array.isArray(bars) ? bars : []
-    return out[sym]
+    let bars = []
+    try {
+      const opts = { period: String(period) }
+      if (start) opts.startDate = start
+      if (end) opts.endDate = end
+      const r = await fetchWithRetry(() => sdk.kline.cnMinute(sym, opts))
+      bars = Array.isArray(r) ? r : []
+    } catch (e) {
+      process.stderr.write(`[minute] 东财失败 ${sym}: ${String((e && e.message) || e)}\n`)
+    }
+    if (!bars.length) {
+      try {
+        bars = (await fetchSinaMinute(sym, period)).filter((r) => inWindow(r.date))
+        if (bars.length) {
+          process.stderr.write(
+            `[minute] 已用新浪兜底 ${sym}: ${bars.length} 根 (${start || '-'}~${end || '-'})\n`
+          )
+        }
+      } catch (e) {
+        process.stderr.write(`[minute] 新浪兜底失败 ${sym}: ${String((e && e.message) || e)}\n`)
+      }
+    }
+    out[sym] = bars
   })
   return out
 }

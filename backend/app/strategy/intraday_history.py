@@ -69,6 +69,10 @@ OPEN_30M_MINUTES = 30      # 开盘 30 分钟(上午前30根)
 # 形态对外报「最近 N 分钟内发生过」——LLM 每 llm_interval_seconds(默认300s)才看一次盘,
 # 若只报"本分钟恰好发生", 5 分钟间隔会大概率整段错过事件。
 RECENT_WINDOW_MIN = 5
+# 同一形态两次触发的最小间隔（分钟）。用 10 个交易日实测: 「量价背离」在无冷却时
+# 达 5.5 次/日 —— 缩量阴跌中几乎每分钟都在创"新高"。15 分钟冷却把连续新高合并为
+# 一次事件, 更贴合"一次背离形态"的语义。
+PATTERN_COOLDOWN_MIN = 15
 
 _MORNING_END = 11 * 60 + 30
 
@@ -329,9 +333,21 @@ def pattern_edges(rows: list[dict[str, Any]]) -> dict[str, list[int]]:
     """逐分钟判定四个形态的**边沿事件**，返回各形态命中的分钟下标列表。
 
     用途: ① `derive()` 取"最近一次距今多久"; ② 触发统计按日计数 / 列出触发时刻。
+
+    同一形态受 `PATTERN_COOLDOWN_MIN` 约束: 冷却期内不再重复记一次
+    （否则"缩量中不断创新高"会让量价背离每分钟触发一次）。
     """
     hits: dict[str, list[int]] = {"v_shape": [], "ignite": [],
                                   "no_vol_push": [], "vol_divergence": []}
+    last_hit: dict[str, int | None] = {k: None for k in hits}
+
+    def _record(name: str, i: int) -> None:
+        prev_i = last_hit[name]
+        if prev_i is not None and (i - prev_i) < PATTERN_COOLDOWN_MIN:
+            return
+        hits[name].append(i)
+        last_hit[name] = i
+
     pumped_ever = False
     n = len(rows)
     for i, r in enumerate(rows):
@@ -351,7 +367,7 @@ def pattern_edges(rows: list[dict[str, Any]]) -> dict[str, list[int]]:
                 crossed = False
             if crossed and rel5 is not None and rel5 >= IGNITE_VOL \
                     and pct is not None and pct >= PUMP_PCT:
-                hits["ignite"].append(i)
+                _record("ignite", i)
 
         # V型确认: 当日曾拉升≥3% + 近 lookback 分钟内曾跌破均价线 + 本分钟刚收回
         if pumped_ever and px and vwap and px > vwap:
@@ -360,7 +376,7 @@ def pattern_edges(rows: list[dict[str, Any]]) -> dict[str, list[int]]:
                         for x in rows[lo:i + 1])
             was_below = bool(p and p["price"] and p["vwap"] and p["price"] <= p["vwap"])
             if below and was_below:
-                hits["v_shape"].append(i)
+                _record("v_shape", i)
 
         # 无量拉升诱多: 涨幅≥3% + 价>均价线 + 缩量（组合边沿）
         nvp = bool(pct is not None and pct >= PUMP_PCT and px and vwap and px > vwap
@@ -369,7 +385,7 @@ def pattern_edges(rows: list[dict[str, Any]]) -> dict[str, list[int]]:
                      and p["price"] and p["vwap"] and p["price"] > p["vwap"]
                      and p["rel5"] is not None and p["rel5"] < SHRINK_VOL)
         if nvp and not p_nvp:
-            hits["no_vol_push"].append(i)
+            _record("no_vol_push", i)
 
         # 量价背离: 运行最高价抬升(真创新高) + 缩量（组合边沿）
         vd = bool(px and r["day_high"] and rel5 is not None and rel5 < SHRINK_VOL
@@ -379,7 +395,7 @@ def pattern_edges(rows: list[dict[str, Any]]) -> dict[str, list[int]]:
                     and i >= 2 and rows[i - 2]["day_high"]
                     and p["day_high"] > rows[i - 2]["day_high"])
         if vd and not p_vd:
-            hits["vol_divergence"].append(i)
+            _record("vol_divergence", i)
 
     return hits
 
