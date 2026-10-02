@@ -55,6 +55,14 @@ class SettingsModel(BaseModel):
     commission_pct: float | None = None   # 佣金率 (0.00025 = 万2.5)
     stamp_tax_pct: float | None = None    # 印花税 (0.001 = 千1, 仅卖出)
     slippage_bps: float | None = None     # 滑点 (5 = 5bps)
+    # ── 跟单模式 (二选一) ──
+    #   condition = 条件跟单 (监控事件 → 自动规则), 默认
+    #   llm       = LLM 跟单   (TSP 内置海平方法论判断, paper_llm 自驱)
+    auto_mode: str | None = None
+    llm_symbols: list[str] | None = None          # 空 = 跟随持仓+自选
+    llm_interval_seconds: int | None = None       # LLM 决策最小间隔
+    llm_max_order_amount: float | None = None     # LLM 单笔上限 (元)
+    llm_max_daily_amount: float | None = None     # LLM 当日买入上限 (元)
 
 
 def _resolve_asset_type(request: Request, symbol: str) -> str:
@@ -277,6 +285,17 @@ def update_settings(request: Request, body: SettingsModel, account: str = Query(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"account": acc}
+
+
+@router.get("/llm_status")
+def llm_status(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
+    """LLM 跟单开关状态: 当前模式 / AI 是否就绪 / 标的池 / 上次决策。
+
+    供 UI 的「条件跟单 / LLM跟单」开关展示与排障。
+    """
+    from app.strategy import paper_llm
+
+    return paper_llm.status(_data_dir(request), _acc(request, account))
 
 
 # ===== 自动跟单规则 (V2) =====

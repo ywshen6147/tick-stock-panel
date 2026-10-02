@@ -842,7 +842,21 @@ function AutoRulesPanel({ acc }: { acc: string }) {
   const rules = rulesQ.data?.rules ?? []
   const [creating, setCreating] = useState(false)
 
+  // LLM 跟单开关状态 (模式 / AI 是否就绪 / 标的池 / 上次决策)
+  const llmQ = useQuery({
+    queryKey: ['paper', 'llmStatus', acc],
+    queryFn: () => api.paperLlmStatus(acc),
+  })
+  const llm = llmQ.data
+  const mode: 'condition' | 'llm' = llm?.auto_mode === 'llm' ? 'llm' : 'condition'
+
   const invalidate = () => qc.invalidateQueries({ queryKey: QK.paperAutoRules(acc) })
+  const refreshLlm = () => qc.invalidateQueries({ queryKey: ['paper', 'llmStatus', acc] })
+
+  const modeM = useMutation({
+    mutationFn: (m: 'condition' | 'llm') => api.paperSettings({ auto_mode: m }, acc),
+    onSuccess: refreshLlm,
+  })
 
   const toggleM = useMutation({
     mutationFn: (args: { id: string; enabled: boolean }) => api.paperAutoRuleSetEnabled(args.id, args.enabled, acc),
@@ -853,48 +867,158 @@ function AutoRulesPanel({ acc }: { acc: string }) {
     onSuccess: invalidate,
   })
 
+  // LLM 参数草稿 (随状态刷新回填)
+  const [draft, setDraft] = useState({ interval: '300', maxOrder: '100000', maxDaily: '200000', symbols: '' })
+  const symKey = (llm?.symbols ?? []).join(',')
+  useEffect(() => {
+    if (!llm) return
+    setDraft({
+      interval: String(llm.interval_seconds ?? 300),
+      maxOrder: String(llm.max_order_amount ?? 100000),
+      maxDaily: String(llm.max_daily_amount ?? 200000),
+      symbols: symKey,
+    })
+  }, [llm?.interval_seconds, llm?.max_order_amount, llm?.max_daily_amount, symKey, llm])
+
+  const saveM = useMutation({
+    mutationFn: () => api.paperSettings({
+      llm_interval_seconds: Number(draft.interval) || 300,
+      llm_max_order_amount: Number(draft.maxOrder) || 100000,
+      llm_max_daily_amount: Number(draft.maxDaily) || 200000,
+      llm_symbols: draft.symbols.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean),
+    }, acc),
+    onSuccess: refreshLlm,
+  })
+
   if (creating) {
     return <AutoRuleForm acc={acc} onDone={() => { setCreating(false); invalidate() }} onCancel={() => setCreating(false)} />
   }
+
+  const st = (llm?.state ?? {}) as Record<string, unknown>
+  const inputCls = 'w-full rounded-btn border border-border bg-elevated px-2 py-1 text-xs text-secondary outline-none focus:border-accent'
+
   return (
     <div className="rounded-card border border-border bg-surface p-4">
       <div className="flex items-center justify-between">
         <div className="text-sm font-medium">自动跟单规则</div>
-        <button onClick={() => setCreating(true)} className="flex items-center gap-1 rounded-btn bg-accent/10 px-2.5 py-1 text-xs text-accent transition-colors hover:bg-accent/20">
-          <Plus className="h-3 w-3" /> 新建规则
-        </button>
+        {mode === 'condition' && (
+          <button onClick={() => setCreating(true)} className="flex items-center gap-1 rounded-btn bg-accent/10 px-2.5 py-1 text-xs text-accent transition-colors hover:bg-accent/20">
+            <Plus className="h-3 w-3" /> 新建规则
+          </button>
+        )}
       </div>
-      <div className="mt-1 text-[11px] leading-relaxed text-muted">
-        监控规则/策略触发时自动按规则下单 (默认次日开盘成交), 同标的 {`冷却 N 天`}内不重复触发
-      </div>
-      {rules.length === 0 ? (
-        <div className="py-8 text-center text-xs text-muted">暂无规则 — 新建一条, 让策略信号自动进入模拟盘</div>
-      ) : (
-        <div className="mt-2 space-y-1">
-          {rules.map(r => (
-            <div key={r.id} className="flex items-center gap-2 rounded-btn px-2 py-1.5 text-xs transition-colors hover:bg-elevated/40">
-              <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', r.enabled ? 'bg-bear' : 'bg-muted')} />
-              <span className="w-28 shrink-0 truncate font-medium">{r.name}</span>
-              <span className="w-20 shrink-0 text-muted">{r.match_kind === 'strategy' ? '跟策略' : '跟规则'}</span>
-              <span className="w-32 shrink-0 truncate font-mono text-[11px] text-muted" title={r.match_id}>{r.match_id}</span>
-              <span className={cn('w-8 shrink-0 font-medium', r.side === 'buy' ? 'text-bull' : 'text-bear')}>{r.side === 'buy' ? '买' : '卖'}</span>
-              <span className="w-24 shrink-0 font-mono text-[11px] text-muted">
-                {r.size_mode === 'fixed_amount' ? fmtMoney(r.size_value, 0) : `${r.size_value}% 权益`}
-              </span>
-              <span className="w-16 shrink-0 text-[11px] text-muted">{ORDER_TYPE_LABEL[r.order_type]} · 冷却{r.cooldown_days}天</span>
-              <button
-                onClick={() => toggleM.mutate({ id: r.id, enabled: !r.enabled })}
-                className={cn('ml-auto shrink-0 rounded-btn px-2 py-0.5 text-[10px] transition-colors',
-                  r.enabled ? 'bg-bear/10 text-bear hover:bg-bear/20' : 'bg-elevated text-muted hover:text-secondary')}
-              >
-                {r.enabled ? '停用' : '启用'}
-              </button>
-              <button onClick={() => deleteM.mutate(r.id)} className="shrink-0 rounded p-0.5 text-muted hover:text-danger" title="删除规则">
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
+
+      {/* ── 跟单模式开关: 条件跟单 / LLM跟单 (二选一, 账户级) ── */}
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <span className="text-[11px] text-muted">跟单模式</span>
+        <div className="inline-flex overflow-hidden rounded-btn border border-border">
+          {(['condition', 'llm'] as const).map(m => (
+            <button
+              key={m}
+              onClick={() => modeM.mutate(m)}
+              disabled={modeM.isPending || mode === m}
+              className={cn('px-2.5 py-1 text-xs transition-colors',
+                mode === m ? 'bg-accent/15 font-medium text-accent' : 'text-muted hover:text-secondary')}
+            >
+              {m === 'condition' ? '条件跟单' : 'LLM跟单'}
+            </button>
           ))}
         </div>
+        <span className="text-[11px] text-muted">
+          {mode === 'condition' ? '监控/策略事件触发规则下单' : 'TSP 内置海平分时方法论判断后下单'}
+        </span>
+      </div>
+
+      {mode === 'llm' ? (
+        <div className="mt-3 space-y-2">
+          {!llm?.ai_configured && (
+            <div className="rounded-btn bg-warn/10 px-2 py-1.5 text-[11px] text-warn">
+              AI 未配置 — 请到「设置 → AI」填写 API Key，否则 LLM 跟单不会下单
+            </div>
+          )}
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted">
+            <span>模型: <span className="font-mono text-secondary">{llm?.ai_model || '--'}</span></span>
+            <span>
+              时段: <span className={llm?.in_session ? 'text-bull' : 'text-muted'}>
+                {llm?.in_session ? '盘中(可下单)' : '非交易时段(不下单)'}
+              </span>
+            </span>
+            <span>标的池: <span className="font-mono text-secondary">{(llm?.symbols ?? []).join(', ') || '空(不下单)'}</span></span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+            <label className="block">
+              <span className="text-[10px] text-muted">决策间隔(秒)</span>
+              <input className={inputCls} value={draft.interval} onChange={e => setDraft({ ...draft, interval: e.target.value })} />
+            </label>
+            <label className="block">
+              <span className="text-[10px] text-muted">单笔上限(元)</span>
+              <input className={inputCls} value={draft.maxOrder} onChange={e => setDraft({ ...draft, maxOrder: e.target.value })} />
+            </label>
+            <label className="block">
+              <span className="text-[10px] text-muted">当日买入上限(元)</span>
+              <input className={inputCls} value={draft.maxDaily} onChange={e => setDraft({ ...draft, maxDaily: e.target.value })} />
+            </label>
+            <label className="block">
+              <span className="text-[10px] text-muted">标的池(逗号分隔, 留空跟随持仓+自选)</span>
+              <input className={inputCls} value={draft.symbols} placeholder="688553.SH" onChange={e => setDraft({ ...draft, symbols: e.target.value })} />
+            </label>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => saveM.mutate()}
+              disabled={saveM.isPending}
+              className="rounded-btn bg-accent/10 px-2.5 py-1 text-xs text-accent transition-colors hover:bg-accent/20"
+            >
+              {saveM.isPending ? '保存中…' : '保存 LLM 参数'}
+            </button>
+            {saveM.isError && <span className="text-[11px] text-danger">保存失败: {String((saveM.error as Error)?.message || '')}</span>}
+          </div>
+          <div className="rounded-btn bg-elevated/50 px-2 py-1.5 text-[11px] text-muted">
+            上次决策: {st.last_run_at ? (
+              <>
+                <span className="text-secondary">{String(st.last_run_at)}</span>
+                {' · '}{String(st.last_action ?? '--')}{' · '}{String(st.last_result ?? '--')}
+                {st.last_reason ? <>{' · '}{String(st.last_reason)}</> : null}
+                {st.last_error ? <span className="text-danger">{' · '}{String(st.last_error)}</span> : null}
+              </>
+            ) : '暂无 (盘中每 N 秒自动判断一次)'}
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="mt-1 text-[11px] leading-relaxed text-muted">
+            监控规则/策略触发时自动按规则下单 (默认次日开盘成交), 同标的 {`冷却 N 天`}内不重复触发
+          </div>
+          {rules.length === 0 ? (
+            <div className="py-8 text-center text-xs text-muted">暂无规则 — 新建一条, 让策略信号自动进入模拟盘</div>
+          ) : (
+            <div className="mt-2 space-y-1">
+              {rules.map(r => (
+                <div key={r.id} className="flex items-center gap-2 rounded-btn px-2 py-1.5 text-xs transition-colors hover:bg-elevated/40">
+                  <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', r.enabled ? 'bg-bear' : 'bg-muted')} />
+                  <span className="w-28 shrink-0 truncate font-medium">{r.name}</span>
+                  <span className="w-20 shrink-0 text-muted">{r.match_kind === 'strategy' ? '跟策略' : '跟规则'}</span>
+                  <span className="w-32 shrink-0 truncate font-mono text-[11px] text-muted" title={r.match_id}>{r.match_id}</span>
+                  <span className={cn('w-8 shrink-0 font-medium', r.side === 'buy' ? 'text-bull' : 'text-bear')}>{r.side === 'buy' ? '买' : '卖'}</span>
+                  <span className="w-24 shrink-0 font-mono text-[11px] text-muted">
+                    {r.size_mode === 'fixed_amount' ? fmtMoney(r.size_value, 0) : `${r.size_value}% 权益`}
+                  </span>
+                  <span className="w-16 shrink-0 text-[11px] text-muted">{ORDER_TYPE_LABEL[r.order_type]} · 冷却{r.cooldown_days}天</span>
+                  <button
+                    onClick={() => toggleM.mutate({ id: r.id, enabled: !r.enabled })}
+                    className={cn('ml-auto shrink-0 rounded-btn px-2 py-0.5 text-[10px] transition-colors',
+                      r.enabled ? 'bg-bear/10 text-bear hover:bg-bear/20' : 'bg-elevated text-muted hover:text-secondary')}
+                  >
+                    {r.enabled ? '停用' : '启用'}
+                  </button>
+                  <button onClick={() => deleteM.mutate(r.id)} className="shrink-0 rounded p-0.5 text-muted hover:text-danger" title="删除规则">
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   )

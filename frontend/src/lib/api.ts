@@ -1206,8 +1206,27 @@ export interface PaperAccount {
   stamp_tax_pct: number
   slippage_bps: number
   queue_limit_orders?: boolean
+  /** 跟单模式: condition=条件跟单 (默认) / llm=LLM跟单 (TSP 内置海平方法论) */
+  auto_mode?: 'condition' | 'llm'
+  llm_symbols?: string[]
+  llm_interval_seconds?: number
+  llm_max_order_amount?: number
+  llm_max_daily_amount?: number
   status: 'active' | 'frozen'
   created_at: string
+}
+
+/** LLM 跟单开关状态 (GET /api/paper/llm_status) */
+export interface PaperLlmStatus {
+  auto_mode: 'condition' | 'llm'
+  ai_configured: boolean
+  ai_model: string
+  in_session: boolean
+  interval_seconds: number
+  max_order_amount: number
+  max_daily_amount: number
+  symbols: string[]
+  state: Record<string, unknown>
 }
 
 export interface PaperAccountSummary {
@@ -3967,11 +3986,19 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  paperSettings: (body: { queue_limit_orders?: boolean; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number }, account?: string) =>
+  paperSettings: (body: {
+    queue_limit_orders?: boolean; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number
+    auto_mode?: 'condition' | 'llm'; llm_symbols?: string[]; llm_interval_seconds?: number
+    llm_max_order_amount?: number; llm_max_daily_amount?: number
+  }, account?: string) =>
     request<{ account: PaperAccount }>(accUrl('/api/paper/settings', account), {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+
+  /** LLM 跟单开关状态 (模式 / AI 是否就绪 / 标的池 / 上次决策) */
+  paperLlmStatus: (account?: string) =>
+    request<PaperLlmStatus>(accUrl('/api/paper/llm_status', account)),
 
   paperOrderCreate: (body: { symbol: string; side: 'buy' | 'sell'; qty?: number; amount?: number; order_type: 'market' | 'next_open' | 'close'; ref_price?: number }, account?: string) =>
     request<{ order: PaperOrder }>(accUrl('/api/paper/orders', account), {

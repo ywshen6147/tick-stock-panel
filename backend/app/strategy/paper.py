@@ -233,9 +233,13 @@ def list_accounts(data_dir: Path) -> list[dict]:
 
 
 def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fields) -> dict:
-    """更新账户设置 (涨跌停排队 / 费用三参数); 未知字段忽略。返回更新后账户。
+    """更新账户设置 (涨跌停排队 / 费用三参数 / 跟单模式); 未知字段忽略。返回更新后账户。
 
     费用只影响之后的新成交 (与回测费用模型同口径), 已有台账不重算。
+
+    ``auto_mode`` 决定该账户的自动跟单方式:
+      - ``"condition"`` (默认): 仅 paper_auto 条件跟单
+      - ``"llm"``: 走 paper_llm 的 LLM 跟单 (不再走条件跟单)
     """
     with PAPER_LOCK:
         acc = get_account(data_dir, account_id)
@@ -243,10 +247,28 @@ def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fiel
             raise ValueError("尚未创建模拟账户")
         if "queue_limit_orders" in fields and fields["queue_limit_orders"] is not None:
             acc["queue_limit_orders"] = bool(fields["queue_limit_orders"])
+        # 跟单模式 (条件跟单 / LLM 跟单)
+        mode = fields.get("auto_mode")
+        if mode is not None:
+            m = str(mode).strip().lower()
+            if m not in ("condition", "llm"):
+                raise ValueError("auto_mode 必须是 condition(条件跟单) 或 llm(LLM跟单)")
+            acc["auto_mode"] = m
+        # LLM 跟单标的池: 接受列表或逗号分隔字符串; 空列表表示"跟随持仓+自选"
+        if "llm_symbols" in fields and fields["llm_symbols"] is not None:
+            syms = fields["llm_symbols"]
+            if isinstance(syms, str):
+                syms = syms.replace("，", ",").split(",")
+            if not isinstance(syms, (list, tuple)):
+                raise ValueError("llm_symbols 必须是列表或逗号分隔字符串")
+            acc["llm_symbols"] = [str(s).strip() for s in syms if str(s).strip()]
         for key, lo, hi in (
             ("commission_pct", 0.0, 0.01),    # 佣金率 ≤1% (100‱)
             ("stamp_tax_pct", 0.0, 0.05),     # 印花税 ≤5% (仅卖出)
             ("slippage_bps", 0.0, 200.0),     # 滑点 ≤200bps
+            ("llm_interval_seconds", 30.0, 7200.0),   # LLM 决策最小间隔 (秒)
+            ("llm_max_order_amount", 1.0, 1e9),       # LLM 单笔上限 (元)
+            ("llm_max_daily_amount", 1.0, 1e9),       # LLM 当日买入上限 (元)
         ):
             v = fields.get(key)
             if v is None:
@@ -254,7 +276,7 @@ def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fiel
             v = float(v)
             if not (lo <= v <= hi):
                 raise ValueError(f"{key} 超出合理范围 ({lo}~{hi})")
-            acc[key] = v
+            acc[key] = int(v) if key == "llm_interval_seconds" else v
         save_account(data_dir, acc, account_id)
         return acc
 

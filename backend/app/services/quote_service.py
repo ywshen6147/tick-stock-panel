@@ -1328,7 +1328,7 @@ class QuoteService:
             if stock_ready and self._app_state is not None:
                 try:
                     from app.strategy import paper as paper_trading
-                    from app.strategy import paper_auto
+                    from app.strategy import paper_auto, paper_llm
                     data_dir = self._app_state.repo.store.data_dir
                     snapshot = dict(zip(
                         enriched_today["symbol"].to_list(),
@@ -1339,7 +1339,16 @@ class QuoteService:
                     for acc_id in paper_trading.list_account_ids(data_dir):
                         paper_events.extend(
                             paper_trading.evaluate_intraday(data_dir, snapshot, account_id=acc_id))
-                        if rule_events:
+                        # 跟单模式二选一(账户级 auto_mode):
+                        #   llm       → TSP 内置 LLM 判断 (paper_llm, 自驱, 不依赖外部触发)
+                        #   condition → 条件跟单 (监控事件 → 自动规则), 默认
+                        acc_row = paper_trading.get_account(data_dir, acc_id) or {}
+                        if paper_llm.auto_mode(acc_row) == paper_llm.AUTO_MODE_LLM:
+                            try:
+                                paper_llm.maybe_run(data_dir, acc_id, snapshot)
+                            except Exception:
+                                logger.debug("paper llm auto dispatch failed acc=%s", acc_id, exc_info=True)
+                        elif rule_events:
                             created = paper_auto.on_rule_events(data_dir, rule_events, account_id=acc_id)
                             paper_events.extend(paper_auto.auto_order_events(created, account_id=acc_id))
                     # 成交/自动跟单下单推送 (V3): 复用监控中心既有管道 —— SSE toast /
@@ -1460,7 +1469,14 @@ class QuoteService:
         minute_df = pl.DataFrame()
         if asset_type == "stock":
             svc = getattr(self._app_state, "minute_refresh", None) if self._app_state else None
-            if svc is not None and svc.is_healthy() and self._repo is not None:
+            # 仅当服务维护 kline_minute 主分区 (真实分钟K) 时才本地读; 合成源
+            # (stocksdk 实时快照) 写独立目录 kline_minute_rt, 无真实 OHLC/量额,
+            # 分时信号读它会算出错误量价信号 → 回落 API 拉取真实分钟。
+            if (
+                svc is not None and svc.is_healthy()
+                and getattr(svc, "writes_main_partition", lambda: False)()
+                and self._repo is not None
+            ):
                 try:
                     minute_df = self._repo.get_minute_batch(sorted(symbols), cn_today())
                 except Exception as e:  # 本地读异常回落 API
