@@ -875,6 +875,12 @@ function AutoRulesPanel({ acc }: { acc: string }) {
     queryFn: () => api.paperLlmStatus(acc),
   })
   const llm = llmQ.data
+  // LLM 触发统计（形态频率 / 决策结果 / 未下单原因）—— 跑几天后据此校准阈值
+  const statsQ = useQuery({
+    queryKey: ['paper', 'llmStats', acc],
+    queryFn: () => api.paperLlmStats(acc, 7),
+  })
+  const stats = statsQ.data
   const mode: 'condition' | 'llm' = llm?.auto_mode === 'llm' ? 'llm' : 'condition'
 
   const invalidate = () => qc.invalidateQueries({ queryKey: QK.paperAutoRules(acc) })
@@ -1079,6 +1085,47 @@ function AutoRulesPanel({ acc }: { acc: string }) {
                 </span>
               ))}
             </div>
+          )}
+          {/* 触发统计：四个形态各触发几次 + 决策结果 + 未下单原因（跑几天后据此校准阈值）*/}
+          {stats && stats.days.length > 0 && (
+            <details className="rounded-btn bg-elevated/50 px-2 py-1.5 text-[11px] text-muted">
+              <summary className="cursor-pointer select-none">
+                触发统计（近 {stats.days.length} 个交易日）
+                <span className="ml-2 font-mono text-[10px]">
+                  V型{stats.totals.patterns.v_shape ?? 0} 点火{stats.totals.patterns.ignite ?? 0}
+                  {' '}诱多{stats.totals.patterns.no_vol_push ?? 0} 背离{stats.totals.patterns.vol_divergence ?? 0}
+                  {' | '}下单{stats.totals.ordered}/决策{stats.totals.runs}
+                </span>
+              </summary>
+              <div className="mt-1.5 space-y-1">
+                {stats.days.map(d => (
+                  <div key={d.date} className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                    <span className="w-[74px] shrink-0 font-mono text-secondary">{d.date}</span>
+                    {d.has_history ? (
+                      <span className="font-mono" title={(d.pattern_times.v_shape ?? []).join(' ')}>
+                        V型{d.patterns.v_shape ?? 0} 点火{d.patterns.ignite ?? 0}
+                        {' '}诱多{d.patterns.no_vol_push ?? 0} 背离{d.patterns.vol_divergence ?? 0}
+                      </span>
+                    ) : (
+                      <span className="text-muted/60">无快照历史</span>
+                    )}
+                    <span>决策{d.runs} 下单{d.ordered} 拒绝{d.rejected} 观望{d.hold}</span>
+                    {d.reject_reasons[0] && (
+                      <span
+                        className="text-danger/80"
+                        title={d.reject_reasons.map(r => `${r.reason} ×${r.count}`).join('\n')}
+                      >
+                        主因: {d.reject_reasons[0].reason}(×{d.reject_reasons[0].count})
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div className="mt-1 text-[10px] leading-relaxed text-muted/70">
+                形态为「最近 5 分钟内发生过」的事件统计；快照历史只在 LLM 模式运行期间累积，
+                故更早的日期显示"无快照历史"。
+              </div>
+            </details>
           )}
         </div>
       ) : (

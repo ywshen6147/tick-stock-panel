@@ -1090,3 +1090,101 @@ def status(data_dir: Path, account_id: str) -> dict[str, Any]:
         "symbols": resolve_symbols(data_dir, account_id, acc),
         "state": load_state(data_dir, account_id),
     }
+
+
+# ── 触发统计（形态频率 + 决策结果 + 未下单原因） ────────────────────
+def stats(data_dir: Path, account_id: str, days: int = 7) -> dict[str, Any]:
+    """按日汇总 LLM 跟单的形态触发与决策结果。
+
+    回答两个问题:
+      ① 四个形态各触发了几次、什么时刻（需当日有快照历史; 历史只在 LLM 账户
+         运行期间累积, 故更早的日期可能没有数据）;
+      ② **触发了但没下单**的原因 —— 决策流水里的 rejected 错误文案与 hold 记录。
+    """
+    try:
+        n_days = max(1, min(int(days or 7), 60))
+    except (TypeError, ValueError):
+        n_days = 7
+    try:
+        acc = paper.get_account(data_dir, account_id) or {}
+    except Exception:
+        acc = {}
+    symbols = resolve_symbols(data_dir, account_id, acc)
+
+    # 1) 决策流水按日聚合
+    recs: list[dict[str, Any]] = []
+    try:
+        p = _log_path(data_dir, account_id)
+        if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        recs.append(json.loads(line))
+                    except Exception:
+                        continue
+    except Exception:
+        logger.debug("llm stats: decision log read failed", exc_info=True)
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for r in recs:
+        d = str(r.get("ts") or "")[:10]
+        if not d:
+            continue
+        b = buckets.setdefault(d, {"runs": 0, "ordered": 0, "rejected": 0, "hold": 0,
+                                   "reasons": {}, "orders": []})
+        b["runs"] += 1
+        res = str(r.get("result") or "")
+        if res in ("ordered", "rejected", "hold"):
+            b[res] += 1
+        if res == "rejected":
+            key = str(r.get("error") or "未知原因")[:70]
+            b["reasons"][key] = b["reasons"].get(key, 0) + 1
+        if res == "ordered":
+            b["orders"].append({
+                "ts": r.get("ts"), "action": r.get("action"), "symbol": r.get("symbol"),
+                "qty": r.get("qty"), "price": r.get("price"), "reason": r.get("reason"),
+                "mode": "price_level" if r.get("trigger") == "price_level" else "llm",
+            })
+
+    # 2) 形态触发（仅"有快照历史"的日期可算）
+    from app.strategy import intraday_history
+
+    hist_days = set(intraday_history.available_days(data_dir))
+    out_days: list[dict[str, Any]] = []
+    p_totals = {"v_shape": 0, "ignite": 0, "no_vol_push": 0, "vol_divergence": 0}
+    t_runs = t_ordered = t_rejected = t_hold = 0
+    for d in sorted(set(buckets) | hist_days, reverse=True)[:n_days]:
+        b = buckets.get(d) or {"runs": 0, "ordered": 0, "rejected": 0, "hold": 0,
+                               "reasons": {}, "orders": []}
+        try:
+            pe = intraday_history.daily_pattern_events(data_dir, d, symbols)
+        except Exception:
+            pe = {}
+        counts = {k: len(v) for k, v in pe.items()} if pe else {}
+        has_hist = d in hist_days and any(pe.values())
+        for k in p_totals:
+            p_totals[k] += counts.get(k, 0)
+        t_runs += b["runs"]; t_ordered += b["ordered"]
+        t_rejected += b["rejected"]; t_hold += b["hold"]
+        out_days.append({
+            "date": d,
+            "has_history": has_hist,
+            "patterns": counts,
+            "pattern_times": pe,
+            "runs": b["runs"], "ordered": b["ordered"],
+            "rejected": b["rejected"], "hold": b["hold"],
+            "reject_reasons": [{"reason": k, "count": v}
+                               for k, v in sorted(b["reasons"].items(), key=lambda x: -x[1])],
+            "orders": b["orders"],
+        })
+
+    return {
+        "account": account_id,
+        "symbols": symbols,
+        "days": out_days,
+        "totals": {"patterns": p_totals, "runs": t_runs, "ordered": t_ordered,
+                   "rejected": t_rejected, "hold": t_hold},
+    }

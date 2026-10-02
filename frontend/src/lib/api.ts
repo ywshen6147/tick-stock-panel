@@ -1251,6 +1251,37 @@ export interface PaperLlmStatus {
   }
 }
 
+/** LLM 触发统计的"单日"记录 (GET /api/paper/llm_stats) */
+export interface PaperLlmStatsDay {
+  date: string
+  /** 该日是否有快照历史（历史只在 LLM 账户运行期间累积，更早的日期可能没有） */
+  has_history: boolean
+  /** 四个形态当日触发次数 */
+  patterns: Record<string, number>
+  /** 四个形态的触发时刻 HH:MM */
+  pattern_times: Record<string, string[]>
+  runs: number
+  ordered: number
+  rejected: number
+  hold: number
+  /** 未下单原因（按次数倒序） */
+  reject_reasons: { reason: string; count: number }[]
+  orders: {
+    ts?: string; action?: string; symbol?: string; qty?: number
+    price?: number; reason?: string; mode?: string
+  }[]
+}
+
+export interface PaperLlmStats {
+  account: string
+  symbols: string[]
+  days: PaperLlmStatsDay[]
+  totals: {
+    patterns: Record<string, number>
+    runs: number; ordered: number; rejected: number; hold: number
+  }
+}
+
 export interface PaperAccountSummary {
   id: string
   name: string
@@ -4024,6 +4055,10 @@ export const api = {
   /** LLM 跟单开关状态 (模式 / AI 是否就绪 / 标的池 / 上次决策) */
   paperLlmStatus: (account?: string) =>
     request<PaperLlmStatus>(accUrl('/api/paper/llm_status', account)),
+
+  /** LLM 触发统计：四个形态各触发几次/何时 + 决策结果 + 未下单原因 */
+  paperLlmStats: (account?: string, days = 7) =>
+    request<PaperLlmStats>(accUrl(`/api/paper/llm_stats?days=${days}`, account)),
 
   paperOrderCreate: (body: { symbol: string; side: 'buy' | 'sell'; qty?: number; amount?: number; order_type: 'market' | 'next_open' | 'close'; ref_price?: number }, account?: string) =>
     request<{ order: PaperOrder }>(accUrl('/api/paper/orders', account), {

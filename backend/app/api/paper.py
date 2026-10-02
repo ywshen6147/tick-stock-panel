@@ -304,6 +304,19 @@ def llm_status(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID))
     return paper_llm.status(_data_dir(request), _acc(request, account))
 
 
+@router.get("/llm_stats")
+def llm_stats(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID),
+              days: int = Query(7, ge=1, le=60)):
+    """LLM 跟单**触发统计**: 四个形态各触发几次/何时 + 决策结果 + 未下单原因。
+
+    用于跑几天后回头校准阈值: 形态频繁触发但 `ordered=0` 时, 直接看
+    `reject_reasons` 就知道卡在哪（额度/无持仓/均价线缺失/模型 hold 等）。
+    """
+    from app.strategy import paper_llm
+
+    return paper_llm.stats(_data_dir(request), _acc(request, account), days=days)
+
+
 # ===== 自动跟单规则 (V2) =====
 class AutoRuleModel(BaseModel):
     name: str

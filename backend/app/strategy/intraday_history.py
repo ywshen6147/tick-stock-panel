@@ -175,6 +175,20 @@ def load(data_dir: Path, day: str | None = None) -> dict[str, Any]:
         return {"date": d, "symbols": {}}
 
 
+def available_days(data_dir: Path) -> list[str]:
+    """已记录过快照历史的日期(倒序)。用于触发统计。"""
+    d = data_dir / "user_data" / "intraday_history"
+    if not d.exists():
+        return []
+    out = []
+    for p in d.glob("date=*.json"):
+        try:
+            out.append(p.name.split("=", 1)[1].removesuffix(".json"))
+        except Exception:
+            continue
+    return sorted(out, reverse=True)
+
+
 # ── 派生 ────────────────────────────────────────────────────────
 def _per_minute(minutes: dict[str, dict[str, Any]], order: list[str],
                 day_open: float | None) -> list[dict[str, Any]]:
@@ -311,10 +325,13 @@ def derive(data_dir: Path, symbols: list[str], day_open: dict[str, float] | None
     return out
 
 
-def _pattern_ages(rows: list[dict[str, Any]]) -> dict[str, int | None]:
-    """逐分钟判定四个形态的**边沿**, 返回各自"最近一次发生距今多少分钟"(None=从未)。"""
-    last: dict[str, int | None] = {"v_shape": None, "ignite": None,
-                                   "no_vol_push": None, "vol_divergence": None}
+def pattern_edges(rows: list[dict[str, Any]]) -> dict[str, list[int]]:
+    """逐分钟判定四个形态的**边沿事件**，返回各形态命中的分钟下标列表。
+
+    用途: ① `derive()` 取"最近一次距今多久"; ② 触发统计按日计数 / 列出触发时刻。
+    """
+    hits: dict[str, list[int]] = {"v_shape": [], "ignite": [],
+                                  "no_vol_push": [], "vol_divergence": []}
     pumped_ever = False
     n = len(rows)
     for i, r in enumerate(rows):
@@ -334,7 +351,7 @@ def _pattern_ages(rows: list[dict[str, Any]]) -> dict[str, int | None]:
                 crossed = False
             if crossed and rel5 is not None and rel5 >= IGNITE_VOL \
                     and pct is not None and pct >= PUMP_PCT:
-                last["ignite"] = i
+                hits["ignite"].append(i)
 
         # V型确认: 当日曾拉升≥3% + 近 lookback 分钟内曾跌破均价线 + 本分钟刚收回
         if pumped_ever and px and vwap and px > vwap:
@@ -343,7 +360,7 @@ def _pattern_ages(rows: list[dict[str, Any]]) -> dict[str, int | None]:
                         for x in rows[lo:i + 1])
             was_below = bool(p and p["price"] and p["vwap"] and p["price"] <= p["vwap"])
             if below and was_below:
-                last["v_shape"] = i
+                hits["v_shape"].append(i)
 
         # 无量拉升诱多: 涨幅≥3% + 价>均价线 + 缩量（组合边沿）
         nvp = bool(pct is not None and pct >= PUMP_PCT and px and vwap and px > vwap
@@ -352,7 +369,7 @@ def _pattern_ages(rows: list[dict[str, Any]]) -> dict[str, int | None]:
                      and p["price"] and p["vwap"] and p["price"] > p["vwap"]
                      and p["rel5"] is not None and p["rel5"] < SHRINK_VOL)
         if nvp and not p_nvp:
-            last["no_vol_push"] = i
+            hits["no_vol_push"].append(i)
 
         # 量价背离: 运行最高价抬升(真创新高) + 缩量（组合边沿）
         vd = bool(px and r["day_high"] and rel5 is not None and rel5 < SHRINK_VOL
@@ -362,6 +379,39 @@ def _pattern_ages(rows: list[dict[str, Any]]) -> dict[str, int | None]:
                     and i >= 2 and rows[i - 2]["day_high"]
                     and p["day_high"] > rows[i - 2]["day_high"])
         if vd and not p_vd:
-            last["vol_divergence"] = i
+            hits["vol_divergence"].append(i)
 
-    return {k: (None if v is None else (n - 1 - v)) for k, v in last.items()}
+    return hits
+
+
+def _pattern_ages(rows: list[dict[str, Any]]) -> dict[str, int | None]:
+    """各形态"最近一次发生距今多少分钟"（None = 当日从未发生）。"""
+    hits = pattern_edges(rows)
+    n = len(rows)
+    return {k: (n - 1 - v[-1]) if v else None for k, v in hits.items()}
+
+
+def daily_pattern_events(data_dir: Path, day: str, symbols: list[str],
+                         day_open: dict[str, float] | None = None) -> dict[str, list[str]]:
+    """重算某日各形态的**全部触发时刻**（HH:MM 列表），用于「形态触发统计」。
+
+    ``day_open`` 缺失时退化为"当日第一分钟价"近似（仅影响 `pct_from_open`
+    相关判定的精度，统计用途可接受）。当日无历史文件时各形态返回空列表。
+    """
+    data = load(data_dir, day)
+    syms = data.get("symbols") or {}
+    days = day_open or {}
+    out: dict[str, list[str]] = {"v_shape": [], "ignite": [],
+                                 "no_vol_push": [], "vol_divergence": []}
+    for sym in symbols:
+        minutes: dict[str, dict[str, Any]] = ((syms.get(sym) or {}).get("m")) or {}
+        if not minutes:
+            continue
+        order = sorted(minutes.keys())
+        do = _fnum(days.get(sym)) or _fnum((minutes[order[0]] or {}).get("p"))
+        rows = _per_minute(minutes, order, do)
+        for name, idxs in pattern_edges(rows).items():
+            out[name].extend(rows[i]["hh"] for i in idxs)
+    for name in out:
+        out[name].sort()
+    return out
