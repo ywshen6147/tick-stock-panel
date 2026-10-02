@@ -1345,7 +1345,10 @@ class QuoteService:
                         acc_row = paper_trading.get_account(data_dir, acc_id) or {}
                         if paper_llm.auto_mode(acc_row) == paper_llm.AUTO_MODE_LLM:
                             try:
-                                paper_llm.maybe_run(data_dir, acc_id, snapshot)
+                                # 传本 tick 的行情帧: paper_llm 用它算当日累计均价线
+                                # (vwap = amount/(volume*100)), 不依赖分钟K。
+                                paper_llm.maybe_run(data_dir, acc_id, snapshot,
+                                                    quote_frame=enriched_today)
                             except Exception:
                                 logger.debug("paper llm auto dispatch failed acc=%s", acc_id, exc_info=True)
                         elif rule_events:

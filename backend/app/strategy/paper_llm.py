@@ -81,6 +81,17 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
 注意：`pct_*` 是**小数**不是百分数；`null` 表示数据不足（窗口不满/缺昨收），
 **任何字段为 null 时不要脑补数值，按"数据不足"处理**。
 
+`features[symbol].source` 表示该标的分时数据的来源：
+- `"minute"`   = 来自真实分钟K（字段最全）
+- `"snapshot"` = 来自实时快照的**当日累计成交量/成交额**推得（`vwap` 可信，
+  但 **`vol_ratio_*` / `open_30m_*` 恒为 null** —— 这些需要日内量序列，拿不到）
+- `"none"`     = 无有效分时数据（此时必须 hold）
+
+⚠️ 当 `source == "snapshot"` 时，**不要**使用 `vol_ratio_*` 或 `open_30m_*` 做判断
+（它们为 null）；可以正常使用 `vwap` / `pct_from_open` / `pct_vs_prev_close` /
+`day_high_dist` / `day_low_dist`。量能类买点（放量拉升、缩量末端、无量诱多、
+量价背离）在此来源下条件不完整，应谨慎或输出 hold。
+
 ## 硬性要求
 - 只依据给出的数据判断，**绝不编造**行情；数据不足就输出 hold。
 - **`features[symbol].vwap` 为 null 时，禁止输出 buy/sell，只能 hold** ——
@@ -255,9 +266,75 @@ def _latest_intraday_features(data_dir: Path, symbols: list[str]) -> dict[str, d
     return out
 
 
+def _snapshot_metrics(frame: Any, symbols: list[str],
+                      prev_close: dict[str, float]) -> dict[str, dict[str, Any]]:
+    """从**实时快照帧**推导分时指标（不依赖分钟K）。
+
+    A股实时快照自带**当日累计成交量/成交额**，因此分时均价线可直接算出：
+
+        vwap = 当日累计成交额 / (当日累计成交量 × 100)      # volume 单位为「手」
+
+    这让「合成分钟源(stocksdk) 不写主分区、主分区无当日分钟K」的部署下，
+    依然有**可信的当日均价线**可用（数字来自真实累计成交额，不是合成的）。
+
+    同时可得: 相对开盘涨跌幅 / 相对昨收涨跌幅 / 距当日最高最低。
+    拿不到: 放量比(需日内量序列)、开盘30分钟高低(需分钟K) —— 保持 None，
+    由提示词的 null 语义约束模型不得据此下单。
+    """
+    out: dict[str, dict[str, Any]] = {}
+    if frame is None:
+        return out
+    try:
+        import polars as pl
+
+        cols = set(getattr(frame, "columns", []) or [])
+        if "symbol" not in cols:
+            return out
+        price_col = "raw_close" if "raw_close" in cols else ("close" if "close" in cols else None)
+        if price_col is None:
+            return out
+        need = [c for c in ("symbol", price_col, "open", "raw_high", "raw_low", "volume", "amount")
+                if c in cols]
+        sub = frame.select(need).filter(pl.col("symbol").cast(pl.Utf8).is_in(symbols))
+
+        def _pct(num: Any, den: Any) -> float | None:
+            try:
+                n, d = float(num), float(den)
+                return round(n / d - 1.0, 6) if d else None
+            except (TypeError, ValueError):
+                return None
+
+        for r in sub.to_dicts():
+            sym = str(r.get("symbol") or "").strip()
+            if not sym:
+                continue
+            price = r.get(price_col)
+            vol, amt = r.get("volume"), r.get("amount")
+            vwap = None
+            try:
+                if vol is not None and amt is not None and float(vol) > 0 and float(amt) > 0:
+                    vwap = round(float(amt) / (float(vol) * 100.0), 4)
+            except (TypeError, ValueError):
+                vwap = None
+            out[sym] = {
+                "price": float(price) if price is not None else None,
+                "vwap": vwap,
+                "pct_from_open": _pct(price, r.get("open")),
+                "pct_vs_prev_close": _pct(price, prev_close.get(sym)),
+                "day_high_dist": _pct(price, r.get("raw_high")),
+                "day_low_dist": _pct(price, r.get("raw_low")),
+                "volume": vol,
+                "amount": amt,
+            }
+    except Exception:
+        logger.debug("snapshot metrics failed", exc_info=True)
+    return out
+
+
 # ── 上下文构建 ──────────────────────────────────────────────────
 def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
-                   snapshot: dict[str, float], symbols: list[str]) -> dict[str, Any]:
+                   snapshot: dict[str, float], symbols: list[str],
+                   quote_frame: Any = None) -> dict[str, Any]:
     positions = {}
     try:
         for sym, pos in (paper.load_positions(data_dir, account_id) or {}).items():
@@ -288,8 +365,35 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
         if p:
             quotes[s] = round(float(p), 4)
 
-    # 分时特征（vwap/量比/涨跌幅/当日高低…）—— 海平方法论判断的必需输入
-    features = _latest_intraday_features(data_dir, symbols)
+    # 分时特征：分钟K（若当日分区存在，字段最全）优先；不足处用**实时快照的
+    # 当日累计量额**兜底（vwap 由此可得，不依赖分钟K/不依赖 TickFlow）。
+    prev_close = _prev_close_map(data_dir, symbols)
+    minute_feat = _latest_intraday_features(data_dir, symbols)
+    snap_metrics = _snapshot_metrics(quote_frame, symbols, prev_close)
+
+    feature_keys = (
+        "price", "vwap", "pct_from_open", "pct_vs_prev_close",
+        "vol_ratio_1m_today", "vol_ratio_3m_today", "vol_ratio_5m_today",
+        "day_high_dist", "day_low_dist",
+        "open_30m_high_dist", "open_30m_low_dist",
+    )
+    features: dict[str, dict[str, Any]] = {}
+    for sym in symbols:
+        mf = minute_feat.get(sym) or {}
+        sm = snap_metrics.get(sym) or {}
+        merged: dict[str, Any] = {}
+        for k in feature_keys:
+            v = mf.get(k)
+            merged[k] = v if v is not None else sm.get(k)
+        if mf.get("vwap") is not None:
+            merged["source"] = "minute"          # 真实分钟K
+        elif sm.get("vwap") is not None:
+            merged["source"] = "snapshot"        # 实时快照累计量额（可信 vwap）
+        else:
+            merged["source"] = "none"
+        merged["bar_time"] = mf.get("bar_time")
+        if merged.get("vwap") is not None or merged.get("price") is not None:
+            features[sym] = merged
 
     return {
         "time": cn_now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -448,7 +552,8 @@ def _execute(data_dir: Path, account_id: str, acc: dict[str, Any], decision: dic
     return rec
 
 
-async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float]) -> dict[str, Any]:
+async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float],
+                    quote_frame: Any = None) -> dict[str, Any]:
     acc = paper.get_account(data_dir, account_id)
     if acc is None:
         return {"result": "skipped", "error": "账户不存在"}
@@ -460,7 +565,7 @@ async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float])
         _append_decision(data_dir, account_id, rec)
         return rec
 
-    ctx = _build_context(data_dir, account_id, acc, snapshot, symbols)
+    ctx = _build_context(data_dir, account_id, acc, snapshot, symbols, quote_frame=quote_frame)
     decision, raw = await _decide(ctx)
     if decision is None:
         rec = {"ts": cn_now().isoformat(timespec="seconds"), "account": account_id,
@@ -493,8 +598,12 @@ def _mark_state_after(data_dir: Path, account_id: str, rec: dict[str, Any]) -> N
 
 # ── 行情循环入口（同步，立即返回；真正工作在线程里） ────────────────
 def maybe_run(data_dir: Path, account_id: str, snapshot: dict[str, float],
-              *, now: datetime | None = None) -> bool:
+              *, quote_frame: Any = None, now: datetime | None = None) -> bool:
     """行情循环每 tick 调用。命中全部闸门才起线程跑一次 LLM 决策。
+
+    ``quote_frame``: 本 tick 的增强行情帧（含当日累计 volume/amount、open、
+    raw_high/raw_low）——用于推导分时均价线。只在真正决策时（节流后）才被读取，
+    每 tick 传引用本身无开销。
 
     返回是否**启动**了一次运行（不代表决策成功）。
     """
@@ -522,7 +631,8 @@ def maybe_run(data_dir: Path, account_id: str, snapshot: dict[str, float],
 
         def _worker() -> None:
             try:
-                rec = asyncio.run(_run_once(data_dir, account_id, dict(snapshot or {})))
+                rec = asyncio.run(_run_once(data_dir, account_id, dict(snapshot or {}),
+                                            quote_frame=quote_frame))
                 _mark_state_after(data_dir, account_id, rec)
             except Exception as e:  # noqa: BLE001
                 logger.warning("llm auto worker failed account=%s: %s", account_id, e)
