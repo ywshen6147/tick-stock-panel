@@ -270,6 +270,8 @@ def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fiel
             ("llm_max_order_amount", 1.0, 1e9),       # LLM 单笔上限 (元)
             ("llm_max_daily_amount", 1.0, 1e9),       # LLM 当日买入上限 (元)
             ("llm_max_daily_sell_amount", 1.0, 1e9),  # LLM 当日卖出上限 (元, 仅常规减仓)
+            # 硬止损阈值 (小数制: 0.03 = 3%; 方法论「止损 2-4 个点」→ 默认 0.03)
+            ("llm_stop_loss_pct", 0.005, 0.20),
             # 价格档位 (0 = 不启用; 命中即确定性执行, 优先于 LLM 判断)
             ("llm_price_add_half", 0.0, 1e6),         # 站上此价 → 加至半仓
             ("llm_price_reduce_half", 0.0, 1e6),      # 跌破此价 → 减至半仓

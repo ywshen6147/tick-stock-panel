@@ -1227,6 +1227,8 @@ export interface PaperLlmStatus {
   max_daily_amount: number
   /** 当日卖出上限（仅约束常规减仓；破位清仓豁免） */
   max_daily_sell_amount: number
+  /** 硬止损阈值（小数制，0.03 = 3%）；由代码兜底执行 */
+  stop_loss_pct: number
   /** 价格档位（0 = 未启用）；命中即确定性执行，优先于 LLM 判断 */
   price_levels: {
     add_half: number
@@ -4047,6 +4049,8 @@ export const api = {
     queue_limit_orders?: boolean; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number
     auto_mode?: 'condition' | 'llm'; llm_symbols?: string[]; llm_interval_seconds?: number
     llm_max_order_amount?: number; llm_max_daily_amount?: number; llm_max_daily_sell_amount?: number
+    /** 硬止损阈值（小数制，0.03 = 3%） */
+    llm_stop_loss_pct?: number
     /** 价格档位（硬规则，命中即执行，优先于 LLM 判断；0 = 不启用） */
     llm_price_add_half?: number; llm_price_reduce_half?: number
     llm_price_full?: number; llm_price_exit_all?: number

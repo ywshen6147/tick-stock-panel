@@ -81,7 +81,8 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
      → 系统判据: `no_vol_push == true`（涨幅 ≥3% + 价 > 均价 + `vol_rel_5m <0.7`）
   6. 量价背离：创当日新高但量能萎缩（第4讲·图pg019）
      → 系统判据: `vol_divergence == true`（刚创当日新高 + `vol_rel_5m <0.7`）
-  7. 硬止损：跌破当日开盘价 3%（第2讲风控：止损2-4个点）
+  7. 硬止损：跌破当日开盘价 `risk.stop_loss_pct`（默认 3%；方法论风控 2-4 个点）
+     —— 这一条**已由系统代码兜底直接执行**，你无需依赖自己记忆
   8. 平低开直接跳水：平/低开且相对开盘再跌 ≥1%（第4讲·图pg017）
      → 系统判据: `flat_low_dive == true`（状态型）
 风控纪律：纪律 > 情绪；止损 > 扛单；胜率 > 单次暴利；没有符合条件的机会就**不交易**。
@@ -561,6 +562,7 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
         },
         "quotes": quotes,
         "features": features,
+        "risk": {"stop_loss_pct": _fnum(acc, "llm_stop_loss_pct", STOP_LOSS_PCT)},
         "symbols": symbols,
     }
 
@@ -827,9 +829,16 @@ def _stop_backstop(acc: dict[str, Any], ctx: dict[str, Any], symbols: list[str],
             pct = float(f.get("pct_from_open")) if f.get("pct_from_open") is not None else None
         except (TypeError, ValueError):
             pct = None
+        # 硬止损阈值可按账户覆盖（llm_stop_loss_pct，小数制）；非法值回落默认。
+        try:
+            _limit = float(acc.get("llm_stop_loss_pct") or STOP_LOSS_PCT)
+        except (TypeError, ValueError):
+            _limit = STOP_LOSS_PCT
+        if not (0 < _limit <= 0.5):
+            _limit = STOP_LOSS_PCT
         reason = None
-        if pct is not None and pct <= -STOP_LOSS_PCT:
-            reason = f"硬止损(代码兜底): 相对开盘 {pct:.2%} ≤ -{STOP_LOSS_PCT:.0%}"
+        if pct is not None and pct <= -_limit:
+            reason = f"硬止损(代码兜底): 相对开盘 {pct:.2%} ≤ -{_limit:.0%}"
         elif down_cross.get(sym):
             reason = "破位(代码兜底): 本分钟下穿分时均价线(S点)"
         if reason:
@@ -1186,6 +1195,8 @@ def status(data_dir: Path, account_id: str) -> dict[str, Any]:
         "max_order_amount": _fnum(acc, "llm_max_order_amount", DEFAULT_MAX_ORDER_AMOUNT),
         "max_daily_amount": _fnum(acc, "llm_max_daily_amount", DEFAULT_MAX_DAILY_AMOUNT),
         "max_daily_sell_amount": _fnum(acc, "llm_max_daily_sell_amount", DEFAULT_MAX_DAILY_SELL_AMOUNT),
+        # 硬止损阈值（小数制，0.03 = 3%）；由代码兜底执行
+        "stop_loss_pct": _fnum(acc, "llm_stop_loss_pct", STOP_LOSS_PCT),
         # 价格档位（0 = 未启用）；命中即确定性执行，优先于 LLM 判断
         "price_levels": {
             "add_half": _fnum(acc, "llm_price_add_half", 0.0),

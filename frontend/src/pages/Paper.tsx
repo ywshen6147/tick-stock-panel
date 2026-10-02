@@ -881,6 +881,9 @@ function AutoRulesPanel({ acc }: { acc: string }) {
     queryFn: () => api.paperLlmStats(acc, 7),
   })
   const stats = statsQ.data
+  // 持仓市值：用于提示「日卖上限 vs 持仓规模」（U2 复核）
+  const ovQ = useQuery({ queryKey: ['paper', 'overview', acc], queryFn: () => api.paperOverview(acc) })
+  const holdingValue = ovQ.data?.market_value ?? 0
   const mode: 'condition' | 'llm' = llm?.auto_mode === 'llm' ? 'llm' : 'condition'
 
   const invalidate = () => qc.invalidateQueries({ queryKey: QK.paperAutoRules(acc) })
@@ -903,7 +906,7 @@ function AutoRulesPanel({ acc }: { acc: string }) {
   // LLM 参数草稿 (随状态刷新回填)
   const [draft, setDraft] = useState({
     interval: '300', maxOrder: '100000', maxDaily: '200000', maxSell: '200000', symbols: '',
-    pAddHalf: '', pReduceHalf: '', pFull: '', pExitAll: '',
+    stopLoss: '3', pAddHalf: '', pReduceHalf: '', pFull: '', pExitAll: '',
   })
   const symKey = (llm?.symbols ?? []).join(',')
   const pl = llm?.price_levels
@@ -916,6 +919,7 @@ function AutoRulesPanel({ acc }: { acc: string }) {
       maxDaily: String(llm.max_daily_amount ?? 200000),
       maxSell: String(llm.max_daily_sell_amount ?? 200000),
       symbols: symKey,
+      stopLoss: String(((llm.stop_loss_pct ?? 0.03) * 100).toFixed(2)).replace(/\.?0+$/, ''),
       pAddHalf: nz(pl?.add_half),
       pReduceHalf: nz(pl?.reduce_half),
       pFull: nz(pl?.full),
@@ -931,6 +935,8 @@ function AutoRulesPanel({ acc }: { acc: string }) {
       llm_max_order_amount: Number(draft.maxOrder) || 100000,
       llm_max_daily_amount: Number(draft.maxDaily) || 200000,
       llm_max_daily_sell_amount: Number(draft.maxSell) || 200000,
+      // UI 用百分数输入，后端存小数（0.03 = 3%）
+      llm_stop_loss_pct: (Number(draft.stopLoss) || 3) / 100,
       llm_symbols: draft.symbols.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean),
       // 价格档位: 空串 = 不启用(传 0), 命中即确定性执行
       llm_price_add_half: Number(draft.pAddHalf) || 0,
@@ -1014,9 +1020,26 @@ function AutoRulesPanel({ acc }: { acc: string }) {
               <input className={inputCls} value={draft.maxSell} onChange={e => setDraft({ ...draft, maxSell: e.target.value })} />
             </label>
             <label className="block">
+              <span className="text-[10px] text-muted">硬止损(% 相对开盘)</span>
+              <input className={inputCls} value={draft.stopLoss} placeholder="3"
+                onChange={e => setDraft({ ...draft, stopLoss: e.target.value })} />
+            </label>
+            <label className="block">
               <span className="text-[10px] text-muted">标的池(逗号分隔, 留空跟随持仓+自选)</span>
               <input className={inputCls} value={draft.symbols} placeholder="688553.SH" onChange={e => setDraft({ ...draft, symbols: e.target.value })} />
             </label>
+          </div>
+          {/* 硬止损与日卖上限的口径提示（含持仓规模对照，便于复核限额是否合理）*/}
+          <div className="mt-1 text-[10px] leading-relaxed text-muted/80">
+            硬止损由<b>代码兜底直接清仓</b>（不依赖模型判断，且 vwap 缺失时仍生效）；
+            当日卖出上限<b>只约束常规减仓</b> —— 破位/止损与价格档位清仓均豁免。
+            {holdingValue > 0 && Number(draft.maxSell) > 0 && (
+              <>
+                <br />
+                当前持仓市值 <b>{fmtMoney(holdingValue, 0)}</b>，按日卖上限 {fmtMoney(Number(draft.maxSell), 0)}
+                常规减仓需约 <b>{Math.ceil(holdingValue / Number(draft.maxSell))} 个交易日</b>（破位通道不受此限）。
+              </>
+            )}
           </div>
 
           {/* ── 价格档位: 硬规则, 命中即执行(优先于 LLM 判断); 留空 = 不启用 ── */}

@@ -64,6 +64,7 @@ class SettingsModel(BaseModel):
     llm_max_order_amount: float | None = None     # LLM 单笔上限 (元)
     llm_max_daily_amount: float | None = None     # LLM 当日买入上限 (元)
     llm_max_daily_sell_amount: float | None = None  # LLM 当日卖出上限 (元, 仅常规减仓)
+    llm_stop_loss_pct: float | None = None        # 硬止损阈值 (小数: 0.03 = 3%)
     # ── 价格档位 (硬规则; 命中即确定性执行, 优先于 LLM 判断; 0/不传 = 不启用) ──
     llm_price_add_half: float | None = None       # 现价 ≥ 此价 → 加至半仓
     llm_price_reduce_half: float | None = None    # 现价 ≤ 此价 → 减至半仓
