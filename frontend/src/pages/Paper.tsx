@@ -895,24 +895,42 @@ function AutoRulesPanel({ acc }: { acc: string }) {
   })
 
   // LLM 参数草稿 (随状态刷新回填)
-  const [draft, setDraft] = useState({ interval: '300', maxOrder: '100000', maxDaily: '200000', symbols: '' })
+  const [draft, setDraft] = useState({
+    interval: '300', maxOrder: '100000', maxDaily: '200000', maxSell: '200000', symbols: '',
+    pAddHalf: '', pReduceHalf: '', pFull: '', pExitAll: '',
+  })
   const symKey = (llm?.symbols ?? []).join(',')
+  const pl = llm?.price_levels
   useEffect(() => {
     if (!llm) return
+    const nz = (v?: number | null) => (v && v > 0 ? String(v) : '')
     setDraft({
       interval: String(llm.interval_seconds ?? 300),
       maxOrder: String(llm.max_order_amount ?? 100000),
       maxDaily: String(llm.max_daily_amount ?? 200000),
+      maxSell: String(llm.max_daily_sell_amount ?? 200000),
       symbols: symKey,
+      pAddHalf: nz(pl?.add_half),
+      pReduceHalf: nz(pl?.reduce_half),
+      pFull: nz(pl?.full),
+      pExitAll: nz(pl?.exit_all),
     })
-  }, [llm?.interval_seconds, llm?.max_order_amount, llm?.max_daily_amount, symKey, llm])
+  }, [llm?.interval_seconds, llm?.max_order_amount, llm?.max_daily_amount,
+      llm?.max_daily_sell_amount, symKey, llm,
+      pl?.add_half, pl?.reduce_half, pl?.full, pl?.exit_all])
 
   const saveM = useMutation({
     mutationFn: () => api.paperSettings({
       llm_interval_seconds: Number(draft.interval) || 300,
       llm_max_order_amount: Number(draft.maxOrder) || 100000,
       llm_max_daily_amount: Number(draft.maxDaily) || 200000,
+      llm_max_daily_sell_amount: Number(draft.maxSell) || 200000,
       llm_symbols: draft.symbols.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean),
+      // 价格档位: 空串 = 不启用(传 0), 命中即确定性执行
+      llm_price_add_half: Number(draft.pAddHalf) || 0,
+      llm_price_reduce_half: Number(draft.pReduceHalf) || 0,
+      llm_price_full: Number(draft.pFull) || 0,
+      llm_price_exit_all: Number(draft.pExitAll) || 0,
     }, acc),
     onSuccess: refreshLlm,
   })
@@ -986,9 +1004,46 @@ function AutoRulesPanel({ acc }: { acc: string }) {
               <input className={inputCls} value={draft.maxDaily} onChange={e => setDraft({ ...draft, maxDaily: e.target.value })} />
             </label>
             <label className="block">
+              <span className="text-[10px] text-muted">当日卖出上限(元)</span>
+              <input className={inputCls} value={draft.maxSell} onChange={e => setDraft({ ...draft, maxSell: e.target.value })} />
+            </label>
+            <label className="block">
               <span className="text-[10px] text-muted">标的池(逗号分隔, 留空跟随持仓+自选)</span>
               <input className={inputCls} value={draft.symbols} placeholder="688553.SH" onChange={e => setDraft({ ...draft, symbols: e.target.value })} />
             </label>
+          </div>
+
+          {/* ── 价格档位: 硬规则, 命中即执行(优先于 LLM 判断); 留空 = 不启用 ── */}
+          <div className="mt-2">
+            <div className="mb-1 text-[10px] text-muted">
+              价格档位（硬规则，命中即刻执行，优先于 LLM 判断；留空 = 不启用）
+            </div>
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+              <label className="block">
+                <span className="text-[10px] text-muted">加半仓价（≥ 此价）</span>
+                <input className={inputCls} value={draft.pAddHalf} placeholder="留空=不启用"
+                  onChange={e => setDraft({ ...draft, pAddHalf: e.target.value })} />
+              </label>
+              <label className="block">
+                <span className="text-[10px] text-muted">减半仓价（≤ 此价）</span>
+                <input className={inputCls} value={draft.pReduceHalf} placeholder="留空=不启用"
+                  onChange={e => setDraft({ ...draft, pReduceHalf: e.target.value })} />
+              </label>
+              <label className="block">
+                <span className="text-[10px] text-muted">满仓价（≥ 此价，用尽现金）</span>
+                <input className={inputCls} value={draft.pFull} placeholder="留空=不启用"
+                  onChange={e => setDraft({ ...draft, pFull: e.target.value })} />
+              </label>
+              <label className="block">
+                <span className="text-[10px] text-muted">清仓价（≤ 此价，全部卖出）</span>
+                <input className={inputCls} value={draft.pExitAll} placeholder="留空=不启用"
+                  onChange={e => setDraft({ ...draft, pExitAll: e.target.value })} />
+              </label>
+            </div>
+            <div className="mt-1 text-[10px] leading-relaxed text-muted/80">
+              仓位按<b>账户权益</b>计：满仓=用尽可用现金；半仓=权益的 50%；清仓=卖光可卖持仓。
+              档位单<b>豁免 LLM 自由裁量限额</b>（但仍受资金预检 / T+1 可卖 / 整手取整约束）。
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <button

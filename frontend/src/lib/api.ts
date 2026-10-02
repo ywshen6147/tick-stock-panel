@@ -1225,6 +1225,15 @@ export interface PaperLlmStatus {
   interval_seconds: number
   max_order_amount: number
   max_daily_amount: number
+  /** 当日卖出上限（仅约束常规减仓；破位清仓豁免） */
+  max_daily_sell_amount: number
+  /** 价格档位（0 = 未启用）；命中即确定性执行，优先于 LLM 判断 */
+  price_levels: {
+    add_half: number
+    reduce_half: number
+    full: number
+    exit_all: number
+  }
   symbols: string[]
   /** 最近一次决策的状态（含最近分时快照 last_market：价格/均价线/数据源） */
   state: {
@@ -4002,7 +4011,10 @@ export const api = {
   paperSettings: (body: {
     queue_limit_orders?: boolean; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number
     auto_mode?: 'condition' | 'llm'; llm_symbols?: string[]; llm_interval_seconds?: number
-    llm_max_order_amount?: number; llm_max_daily_amount?: number
+    llm_max_order_amount?: number; llm_max_daily_amount?: number; llm_max_daily_sell_amount?: number
+    /** 价格档位（硬规则，命中即执行，优先于 LLM 判断；0 = 不启用） */
+    llm_price_add_half?: number; llm_price_reduce_half?: number
+    llm_price_full?: number; llm_price_exit_all?: number
   }, account?: string) =>
     request<{ account: PaperAccount }>(accUrl('/api/paper/settings', account), {
       method: 'POST',

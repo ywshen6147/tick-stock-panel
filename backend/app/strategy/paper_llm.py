@@ -45,6 +45,15 @@ AUTO_MODES = (AUTO_MODE_CONDITION, AUTO_MODE_LLM)
 DEFAULT_INTERVAL_SECONDS = 300
 DEFAULT_MAX_ORDER_AMOUNT = 100_000.0
 DEFAULT_MAX_DAILY_AMOUNT = 200_000.0
+# 卖出日上限: 只约束"常规减仓"; 破位/止损清仓与价格档位清仓**豁免**(否则止损被卡住)
+DEFAULT_MAX_DAILY_SELL_AMOUNT = 200_000.0
+# 档位键 → 中文标签（用于决策记录与告警文案）
+PRICE_LEVEL_LABELS = {
+    "exit_all": "清仓价",
+    "reduce_half": "减半仓价",
+    "full": "满仓价",
+    "add_half": "加半仓价",
+}
 
 _LOCK = threading.Lock()
 _INFLIGHT: set[str] = set()
@@ -112,6 +121,15 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
 - 其他卖点（无量拉升诱多、量价背离、高开震荡缩量、平低开跳水）属**常规减仓**：
   `stop` 填 `false`，按 `amount`（≤单笔上限）分批卖出。
 - 买入时 `stop` 一律 `false`。
+
+## 额度与档位（系统层面，不在你的输出里设置）
+- 单笔 ≤ `max_order_amount`；当日累计买入 ≤ `max_daily_amount`；
+  **当日累计卖出 ≤ `max_daily_sell_amount`（仅约束常规减仓）**。
+- 破位/止损（`stop=true`）的清仓**豁免**卖出日额度 —— 但**不要滥用**：只对
+  ①跌破分时均价线 ②跌破开盘价3% 这两种情形置 true，其余卖点必须按分批处理。
+- `price_levels` 是账户预先设好的**硬价格档位**（清仓价/减半仓价/满仓价/加半仓价），
+  由系统在每次判断前**先行检查并直接执行**。你在输出里**不要**试图与之对抗；
+  若当前价已越过某档位，系统会在你被调用之前就处理掉了。
 """
 
 
@@ -343,17 +361,25 @@ def _snapshot_metrics(frame: Any, symbols: list[str],
 def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
                    snapshot: dict[str, float], symbols: list[str],
                    quote_frame: Any = None) -> dict[str, Any]:
+    today = cn_today().isoformat()
     positions = {}
     try:
         for sym, pos in (paper.load_positions(data_dir, account_id) or {}).items():
-            positions[sym] = {"qty": pos.get("qty"), "available_qty": pos.get("available_qty"),
+            # 物化文件 positions.json 的 available_qty 是上次重建时的 T+1 口径, 跨日不更新
+            # (次日仍为 0)。必须与 create_order 同口径**现算**, 否则模型会以为
+            # "无可卖持仓"而拒绝卖出 —— 实测过这个坑。
+            try:
+                avail = int(paper._available_of(pos, today))
+            except Exception:
+                avail = int(pos.get("qty") or 0)
+            positions[sym] = {"qty": pos.get("qty"), "available_qty": avail,
                               "avg_cost": pos.get("avg_cost")}
     except Exception:
         pass
 
-    today = cn_today().isoformat()
     orders_today = []
     buy_amount_today = 0.0
+    sell_amount_today = 0.0
     try:
         for o in paper.load_orders(data_dir, account_id):
             if str(o.get("created_at") or "")[:10] != today:
@@ -361,9 +387,12 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
             orders_today.append({"symbol": o.get("symbol"), "side": o.get("side"),
                                  "qty": o.get("qty"), "status": o.get("status"),
                                  "source": o.get("source")})
-            if o.get("side") == "buy" and o.get("status") in ("pending", "filled"):
+            if o.get("status") in ("pending", "filled"):
                 est = float(o.get("qty") or 0) * float(o.get("ref_price") or o.get("price") or 0)
-                buy_amount_today += est
+                if o.get("side") == "buy":
+                    buy_amount_today += est
+                elif o.get("side") == "sell":
+                    sell_amount_today += est
     except Exception:
         pass
 
@@ -409,8 +438,17 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
         "positions": positions,
         "orders_today": orders_today,
         "buy_amount_today_est": round(buy_amount_today, 2),
+        "sell_amount_today_est": round(sell_amount_today, 2),
         "max_order_amount": _fnum(acc, "llm_max_order_amount", DEFAULT_MAX_ORDER_AMOUNT),
         "max_daily_amount": _fnum(acc, "llm_max_daily_amount", DEFAULT_MAX_DAILY_AMOUNT),
+        "max_daily_sell_amount": _fnum(acc, "llm_max_daily_sell_amount", DEFAULT_MAX_DAILY_SELL_AMOUNT),
+        # 价格档位（硬规则，优先于 LLM 判断执行；0/未设=不启用）
+        "price_levels": {
+            "add_half": _fnum(acc, "llm_price_add_half", 0.0) or None,
+            "reduce_half": _fnum(acc, "llm_price_reduce_half", 0.0) or None,
+            "full": _fnum(acc, "llm_price_full", 0.0) or None,
+            "exit_all": _fnum(acc, "llm_price_exit_all", 0.0) or None,
+        },
         "quotes": quotes,
         "features": features,
         "symbols": symbols,
@@ -486,10 +524,163 @@ async def _decide(ctx: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
     return _extract_json(text), text
 
 
+# ── 价格档位（硬规则：命中即确定性执行，优先于 LLM 判断） ──────────
+def _price_level_action(acc: dict[str, Any], ctx: dict[str, Any],
+                        symbols: list[str]) -> dict[str, Any] | None:
+    """检查账户级价格档位，命中则返回确定性动作（否则 None，交给 LLM 判断）。
+
+    档位语义（0/未设 = 不启用）:
+      llm_price_exit_all     现价 ≤ 该价 → 清仓（卖光可卖持仓）
+      llm_price_reduce_half  现价 ≤ 该价 → 减至半仓
+      llm_price_full         现价 ≥ 该价 → 买至满仓（用尽可用现金）
+      llm_price_add_half     现价 ≥ 该价 → 加至半仓
+
+    优先级: 清仓 > 减半 > 满仓 > 加半（风险动作优先）。
+    """
+
+    def _lv(key: str) -> float | None:
+        try:
+            v = float(acc.get(key) or 0)
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    quotes = ctx.get("quotes") or {}
+    positions = ctx.get("positions") or {}
+    for sym in symbols:
+        try:
+            px = float(quotes.get(sym) or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px <= 0:
+            continue
+        qty = int((positions.get(sym) or {}).get("qty") or 0)
+
+        lv_exit = _lv("llm_price_exit_all")
+        lv_reduce = _lv("llm_price_reduce_half")
+        lv_full = _lv("llm_price_full")
+        lv_add = _lv("llm_price_add_half")
+
+        if lv_exit and px <= lv_exit and qty > 0:
+            return {"action": "sell", "symbol": sym, "target": "exit", "stop": True,
+                    "reason": f"价格档位·跌破清仓价 {lv_exit}",
+                    "basis": f"价格档位 清仓价 {lv_exit}"}
+        if lv_reduce and px <= lv_reduce and qty > 0:
+            return {"action": "sell", "symbol": sym, "target": "half",
+                    "reason": f"价格档位·跌破减半仓价 {lv_reduce}",
+                    "basis": f"价格档位 减半仓价 {lv_reduce}"}
+        if lv_full and px >= lv_full:
+            return {"action": "buy", "symbol": sym, "target": "full",
+                    "reason": f"价格档位·站上满仓价 {lv_full}",
+                    "basis": f"价格档位 满仓价 {lv_full}"}
+        if lv_add and px >= lv_add:
+            return {"action": "buy", "symbol": sym, "target": "half",
+                    "reason": f"价格档位·站上加半仓价 {lv_add}",
+                    "basis": f"价格档位 加半仓价 {lv_add}"}
+    return None
+
+
+def _execute_price_level(data_dir: Path, account_id: str, acc: dict[str, Any],
+                         act: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    """执行价格档位动作：目标仓位 → 股数 → 下单。
+
+    仓位以**账户权益**衡量（权益 = 现金 + 持仓市值，按快照价）:
+      满仓 = 买至权益 100%（= 用尽可用现金）
+      半仓 = 买/卖至权益 50%
+      清仓 = 卖光可卖持仓
+
+    价格档位是**用户的明确指令**, 因此豁免 LLM 自由裁量限额
+    (单笔上限 / 当日买限额 / 当日卖限额) —— 否则"满仓价"永远买不满。
+    平台级硬约束仍然生效: 资金预检、T+1 可卖、超卖防护、账户冻结、整手取整。
+    """
+    sym = act["symbol"]
+    target = act.get("target")
+    rec: dict[str, Any] = {
+        "ts": cn_now().isoformat(timespec="seconds"), "account": account_id,
+        "action": act.get("action"), "symbol": sym, "target": target,
+        "reason": act.get("reason"), "basis": act.get("basis"),
+        "trigger": "price_level", "cap_exempt": True,
+    }
+    try:
+        price = float((ctx.get("quotes") or {}).get(sym) or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    if price <= 0:
+        rec["result"] = "rejected"; rec["error"] = "无有效现价"
+        return rec
+
+    pos = {}
+    try:
+        pos = (paper.load_positions(data_dir, account_id) or {}).get(sym) or {}
+    except Exception:
+        pos = {}
+    qty_now = int(pos.get("qty") or 0)
+    try:
+        avail = int(paper._available_of(pos, cn_today().isoformat())) if pos else 0
+    except Exception:
+        avail = 0
+
+    cash = 0.0
+    try:
+        cash = float(acc.get("cash") or 0)
+    except (TypeError, ValueError):
+        cash = 0.0
+    hold_mv = qty_now * price
+    equity = cash + hold_mv
+
+    side = str(act.get("action") or "")
+    qty = 0
+    if target == "exit":
+        qty = (avail // 100) * 100
+    elif target == "half":
+        # 方向由档位决定，不能反向操作：
+        #   加半仓价 → 只允许买入到半仓（已在半仓以上则不动，绝不因此卖出）
+        #   减半仓价 → 只允许卖出到半仓（已在半仓以下则不动，绝不因此买入）
+        delta = equity * 0.5 - hold_mv
+        want = str(act.get("action") or "")
+        if want == "buy":
+            side = "buy"
+            qty = (min(max(delta, 0.0), cash) // (price * 100)) * 100
+        else:
+            side = "sell"
+            qty = (min(max(-delta, 0.0) / price, float(avail)) // 100) * 100
+    elif target == "full":
+        side = "buy"
+        qty = (cash // (price * 100)) * 100
+    else:
+        rec["result"] = "rejected"; rec["error"] = f"未知档位目标: {target!r}"
+        return rec
+
+    rec["action"] = side
+    if qty <= 0:
+        rec["result"] = "rejected"
+        rec["error"] = (f"档位无需调仓 (目标{target}: 现价{price}, 持仓{qty_now}, "
+                        f"可卖{avail}, 现金{cash:.0f})")
+        return rec
+
+    qty = int(qty)
+    rec["qty"] = qty
+    rec["amount"] = round(qty * price, 2)
+    if target == "exit":
+        rec["stop"] = True
+    order, err = paper.create_order(
+        data_dir, sym, side, account_id=account_id, qty=qty,
+        order_type="market", ref_price=price,
+        source=f"llm:{cn_today().isoformat()}",
+    )
+    if err:
+        rec["result"] = "rejected"; rec["error"] = err
+    else:
+        rec["result"] = "ordered"; rec["order_id"] = order.get("id")
+        rec["qty"] = order.get("qty"); rec["price"] = price
+    return rec
+
+
 def _execute(data_dir: Path, account_id: str, acc: dict[str, Any], decision: dict[str, Any],
              snapshot: dict[str, float], symbols: list[str],
              buy_amount_today: float,
-             features: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+             features: dict[str, dict[str, Any]] | None = None,
+             sell_amount_today: float = 0.0) -> dict[str, Any]:
     """校验决策并下单。返回记录（含 action/order_id/rejected 原因）。"""
     action = str(decision.get("action") or "").strip().lower()
     sym = str(decision.get("symbol") or "").strip()
@@ -584,6 +775,19 @@ def _execute(data_dir: Path, account_id: str, acc: dict[str, Any], decision: dic
             amount = remaining
             rec["capped"] = (rec.get("capped", "") + f"; 当日剩余额度钳制到 {remaining:.0f}").strip("; ")
 
+    if action == "sell":
+        # (a) 卖出日上限: 只约束**常规减仓**(无量诱多/量价背离等)。
+        # 破位/止损清仓在上面的 stop 分支已返回, 天然豁免 —— 否则止损会被额度卡住。
+        max_sell = _fnum(acc, "llm_max_daily_sell_amount", DEFAULT_MAX_DAILY_SELL_AMOUNT)
+        remaining = max_sell - float(sell_amount_today or 0)
+        if remaining <= 0:
+            rec["result"] = "rejected"
+            rec["error"] = f"当日卖出额度已用尽 (上限 {max_sell:.0f})"
+            return rec
+        if amount > remaining:
+            amount = remaining
+            rec["capped"] = (rec.get("capped", "") + f"; 当日卖出额度钳制到 {remaining:.0f}").strip("; ")
+
     rec["amount"] = round(amount, 2)
     order, err = paper.create_order(
         data_dir, sym, action, account_id=account_id,
@@ -623,6 +827,20 @@ async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float],
         }
         for s in symbols
     }
+    decision, raw = None, ""
+    # ── 价格档位优先：命中即确定性执行，不再问 LLM ──────────────
+    # (用户设的硬价格指令应立刻生效; 也省一次模型调用)
+    lvl = _price_level_action(acc, ctx, symbols)
+    if lvl is not None:
+        rec = _execute_price_level(data_dir, account_id, acc, lvl, ctx)
+        rec["market"] = market
+        _append_decision(data_dir, account_id, rec)
+        if rec.get("result") == "ordered":
+            _emit_order_alert(data_dir, account_id, rec)
+        logger.info("llm auto %s: price-level %s result=%s qty=%s", account_id,
+                    lvl.get("target"), rec.get("result"), rec.get("qty"))
+        return rec
+
     decision, raw = await _decide(ctx)
     if decision is None:
         rec = {"ts": cn_now().isoformat(timespec="seconds"), "account": account_id,
@@ -633,7 +851,8 @@ async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float],
 
     rec = _execute(data_dir, account_id, acc, decision, snapshot, symbols,
                    ctx.get("buy_amount_today_est") or 0.0,
-                   features=feats)
+                   features=feats,
+                   sell_amount_today=ctx.get("sell_amount_today_est") or 0.0)
     rec["market"] = market
     _append_decision(data_dir, account_id, rec)
     if rec.get("result") == "ordered":
@@ -766,6 +985,14 @@ def status(data_dir: Path, account_id: str) -> dict[str, Any]:
         "interval_seconds": _inum(acc, "llm_interval_seconds", DEFAULT_INTERVAL_SECONDS),
         "max_order_amount": _fnum(acc, "llm_max_order_amount", DEFAULT_MAX_ORDER_AMOUNT),
         "max_daily_amount": _fnum(acc, "llm_max_daily_amount", DEFAULT_MAX_DAILY_AMOUNT),
+        "max_daily_sell_amount": _fnum(acc, "llm_max_daily_sell_amount", DEFAULT_MAX_DAILY_SELL_AMOUNT),
+        # 价格档位（0 = 未启用）；命中即确定性执行，优先于 LLM 判断
+        "price_levels": {
+            "add_half": _fnum(acc, "llm_price_add_half", 0.0),
+            "reduce_half": _fnum(acc, "llm_price_reduce_half", 0.0),
+            "full": _fnum(acc, "llm_price_full", 0.0),
+            "exit_all": _fnum(acc, "llm_price_exit_all", 0.0),
+        },
         "symbols": resolve_symbols(data_dir, account_id, acc),
         "state": load_state(data_dir, account_id),
     }

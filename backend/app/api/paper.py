@@ -63,6 +63,12 @@ class SettingsModel(BaseModel):
     llm_interval_seconds: int | None = None       # LLM 决策最小间隔
     llm_max_order_amount: float | None = None     # LLM 单笔上限 (元)
     llm_max_daily_amount: float | None = None     # LLM 当日买入上限 (元)
+    llm_max_daily_sell_amount: float | None = None  # LLM 当日卖出上限 (元, 仅常规减仓)
+    # ── 价格档位 (硬规则; 命中即确定性执行, 优先于 LLM 判断; 0/不传 = 不启用) ──
+    llm_price_add_half: float | None = None       # 现价 ≥ 此价 → 加至半仓
+    llm_price_reduce_half: float | None = None    # 现价 ≤ 此价 → 减至半仓
+    llm_price_full: float | None = None           # 现价 ≥ 此价 → 买至满仓
+    llm_price_exit_all: float | None = None       # 现价 ≤ 此价 → 清仓
 
 
 def _resolve_asset_type(request: Request, symbol: str) -> str:
