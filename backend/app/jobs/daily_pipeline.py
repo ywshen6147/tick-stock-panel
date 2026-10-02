@@ -1180,6 +1180,48 @@ def _register_review_job(scheduler, repo, hour: int, minute: int) -> None:
     )
 
 
+# 盘后分钟K补齐时间（收盘后；早于盘后管道默认 15:35，避免与其抢同一批 parquet）
+MINUTE_BACKFILL_HOUR = 15
+MINUTE_BACKFILL_MINUTE = 10
+
+
+def _minute_backfill_symbols(data_dir: Path) -> list[str]:
+    """需要补齐分钟K的标的：自选 ∪ 各模拟账户持仓 ∪ 各账户 LLM 跟单标的池。
+
+    分钟K 是分时图 / 分时信号 / 分钟回测的输入；只覆盖这几个来源即可，不拉全市场
+    （全市场逐标的成本高，且绝大多数标的无人消费）。
+    """
+    syms: set[str] = set()
+    try:
+        from app.services import watchlist as _watchlist
+
+        for row in _watchlist.list_symbols() or []:
+            s = str((row or {}).get("symbol") or "").strip()
+            if s:
+                syms.add(s)
+    except Exception:
+        logger.debug("minute backfill: watchlist read failed", exc_info=True)
+    try:
+        from app.strategy import paper as _paper
+        from app.strategy import paper_llm as _paper_llm
+
+        for acc_id in _paper.list_account_ids(data_dir) or []:
+            acc = _paper.get_account(data_dir, acc_id) or {}
+            try:
+                for sym in (_paper.load_positions(data_dir, acc_id) or {}):
+                    if str(sym).strip():
+                        syms.add(str(sym).strip())
+            except Exception:
+                logger.debug("minute backfill: positions read failed acc=%s", acc_id, exc_info=True)
+            try:
+                syms.update(_paper_llm.resolve_symbols(data_dir, acc_id, acc))
+            except Exception:
+                logger.debug("minute backfill: llm symbols failed acc=%s", acc_id, exc_info=True)
+    except Exception:
+        logger.debug("minute backfill: paper accounts read failed", exc_info=True)
+    return sorted(s for s in syms if s)
+
+
 def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOScheduler:
     """启动调度器。
 
@@ -1302,10 +1344,52 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         logger.info("scheduled_review enabled @%02d:%02d mon-fri",
                     review_sched["hour"], review_sched["minute"])
 
+    # 盘后: 补齐"自选 ∪ 模拟盘持仓/LLM标的池"的分钟K。
+    #   kline_minute 主分区的**自动采集**只由 TickFlow 写; stocksdk 合成分钟只进
+    #   kline_minute_rt。若不主动补，个股分时图/分时信号/分钟回测会长期缺当日数据。
+    #   分钟源走 bridge（东财不可达时已回退新浪），见 plugins/stocksdk/bridge.mjs。
+    def _minute_backfill():
+        if not preferences.get_minute_sync_enabled():
+            logger.info("分钟K 盘后补齐: 偏好已关闭 minute_sync_enabled, 跳过")
+            return
+        app_state = _get_app_state()
+        repo_live = getattr(app_state, "repo", None) or repo
+        capset_live = getattr(app_state, "capabilities", None) or capset
+        data_dir = getattr(getattr(repo_live, "store", None), "data_dir", None)
+        if data_dir is None:
+            logger.warning("分钟K 盘后补齐: 拿不到 data_dir, 跳过")
+            return
+        syms = _minute_backfill_symbols(Path(data_dir))
+        if not syms:
+            logger.info("分钟K 盘后补齐: 无标的（自选/持仓为空）, 跳过")
+            return
+        try:
+            rows = kline_sync.sync_and_persist_minute(
+                syms, repo_live, capset_live,
+                days=preferences.get_minute_sync_days(), force_full_days=True,
+            )
+            logger.info("分钟K 盘后补齐完成: %d 只标的, 写入 %d 行", len(syms), rows)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("分钟K 盘后补齐失败: %s", e)
+
+    scheduler.add_job(
+        _minute_backfill,
+        trigger=CronTrigger(day_of_week="mon-fri",
+                            hour=MINUTE_BACKFILL_HOUR, minute=MINUTE_BACKFILL_MINUTE,
+                            timezone="Asia/Shanghai"),
+        id="minute_backfill",
+        misfire_grace_time=3600,
+        replace_existing=True,
+    )
+
     scheduler.start()
-    logger.info("scheduler started; instruments@%02d:%02d, pipeline@%02d:%02d, depth@%02d:%02d mon-fri",
-                inst_sched["hour"], inst_sched["minute"], sched["hour"], sched["minute"],
-                depth_sched["hour"], depth_sched["minute"])
+    logger.info(
+        "scheduler started; instruments@%02d:%02d, pipeline@%02d:%02d, depth@%02d:%02d, "
+        "minute_backfill@%02d:%02d mon-fri",
+        inst_sched["hour"], inst_sched["minute"], sched["hour"], sched["minute"],
+        depth_sched["hour"], depth_sched["minute"],
+        MINUTE_BACKFILL_HOUR, MINUTE_BACKFILL_MINUTE,
+    )
     return scheduler
 
 
