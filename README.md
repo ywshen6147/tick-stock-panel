@@ -1,6 +1,6 @@
 <div align="center">
 
-# 📈 TSP · A股智能量化工作台
+# <picture><source media="(prefers-color-scheme: dark)" srcset="brand/logo-dark-title.svg"><img src="brand/logo-title.svg" width="30" alt="TSP Logo"></picture> TSP · A股智能量化工作台
 
 <br/>
 
@@ -16,7 +16,9 @@
 
 **自托管 · 零运维 · 核心能力全部开放成接口的 A 股量化工作台**
 
-`选股` · `回测` · `监控` · `因子挖掘` · `AI 助手` · `Open API` · `MCP`
+[![官网](https://img.shields.io/badge/%E5%AE%98%E7%BD%91-tsp.shy313.com-8B5CF6?style=for-the-badge&labelColor=181717&logo=googlechrome&logoColor=white)](https://tsp.shy313.com/)
+
+`策略` · `回测` · `监控` · `因子挖掘` · `AI 助手` · `Open API` · `MCP`
 
 <a href="https://trendshift.io/repositories/64327?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-64327" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/64327" alt="shy3130%2Ftick-stock-panel | Trendshift" width="250" height="55"/></a>
 <a href="https://trendshift.io/repositories/64327?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-64327" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/64327/daily?language=TypeScript" alt="shy3130%2Ftick-stock-panel | Trendshift" width="250" height="55"/></a>
@@ -66,7 +68,7 @@
 | 用脚本/拼凑工具做量化,你大概率遇到过         | TSP 的解法                                                                                               |
 | :------------------------------------------- | :------------------------------------------------------------------------------------------------------- |
 | 数据源绑死,换一家要重写整套拉数代码          | **能力路由矩阵**:6 类数据集按源能力独立路由,随时换源,指标与回测口径不变                                  |
-| 选股、回测、监控各用一套工具,口径对不上      | 全站统一 **enriched 数据口径**:选股 → 回测 → 监控 → 复盘一条链                                           |
+| 策略、回测、监控各用一套工具,口径对不上      | 全站统一 **enriched 数据口径**:策略 → 回测 → 监控 → 复盘一条链                                           |
 | 盘中异动靠人盯盘,错过就是错过                | **竞价/盘中/偏移**全时段异动 + 实时弹窗、语音播报、飞书推送                                              |
 | 想查个数据要在几个页面之间来回点             | **AI 对话助手**:一句话问出全站数据,取数过程逐条可见、可展开核对;还能经确认卡放行生成信号、跑回测、补数据 |
 | 想基于面板数据做自己的工具/机器人,只能爬页面 | **开放接口 + MCP**:Token 六档权限、61 端点契约化、SSE 事件流,AI 客户端即插即用                           |
@@ -83,7 +85,7 @@
 </td>
 <td width="33.3%" valign="top">
 
-**🔍 选股引擎**<br/>25 内置策略 + 自定义信号 + AI 生成, 毫秒级扫全 A 股
+**🔍 策略引擎**<br/>全自定义策略 + 自定义信号 + AI 生成, 毫秒级扫全 A 股
 
 </td>
 <td width="33.3%" valign="top">
@@ -168,10 +170,10 @@
 **📊 行情总览**
 
 - **看板** Dashboard — 市场情绪评分 + 涨跌/成交额榜单 + 概念/行业领涨领跌(点击板块直达成分股,领涨股带涨跌幅) + 大盘异动事件流,一日全貌; **布局可自定义** — 12 列吸附网格, 组件拖拽换位/角柄自由调宽高, 可增删组件、嵌入外部链接(iframe 沙箱), 跨设备同步, 一键恢复默认
-- **自选** Watchlist — 自选股池,多分组管理(M:N),表格/卡片双视图,换手/量比/RSI 等实时指标,按档位分流实时刷新
+- **自选** Watchlist — 自选池,多分组管理(M:N),表格/卡片双视图,换手/量比/RSI 等实时指标,按档位分流实时刷新
 - **指数** Indices — 沪深指数浏览与同步
 
-**🔍 选股与回测**
+**🔍 策略与回测**
 
 - **策略** Screener — Polars 毫秒级扫描全 A 股,日线/分钟策略统一单池,按策略声明周期自动路由执行
 - **回测** Backtest — 四种研究视图:
@@ -195,7 +197,7 @@
 
 - **监控中心** Monitor — 策略/个股信号/价格/异动四类规则,支持自选分组作用域,盘中实时弹窗 + 语音播报(播报个股名称与信号) + 触发记录持久化
 - **持仓提醒** Lots — 记录个股/ETF 买入批次,自动生成止盈止损/到期监控规则
-- **信号库** Signals — 内置预计算信号 + 自定义条件信号(含因子条件与 AI 生成),供策略触发器/回测/监控统一取用
+- **信号库** Signals — 全部为用户定义的条件信号(字段+运算符+阈值,支持因子条件、涨跌停判定价与 AI 生成),供策略触发器/回测/监控统一取用;新装为空库,可自建或导入
 - **异动监控** Abnormal Moves — 按交易时间线三 tab:
   - **竞价异动** — 同花顺盘前风向标(含当日/次日真实收益对照、追高风险标记)+ 全市场竞价扫描(待采集任务)
   - **盘中异动** — 涨停/炸板/翘板/跌停/新高/新低/放量当日信号聚合,零新增采集
@@ -260,7 +262,7 @@
 | 架构特点 | 一句话说明 |
 | :--- | :--- |
 | 🔀 **能力路由矩阵** | 6 类数据集按源声明能力独立路由——换源不换口径,指标与回测结果不变 |
-| 🧬 **单一 enriched 口径** | 只存 15 列基础数据、现算 68 列指标信号;选股 → 回测 → 监控 → 复盘吃同一份数据 |
+| 🧬 **单一 enriched 口径** | 只存 15 列基础数据、现算 68 列指标信号;策略 → 回测 → 监控 → 复盘吃同一份数据 |
 | 📁 **文件型零运维存储** | Parquet + DuckDB,单容器零外部数据库,数据 100% 落在本地 |
 | 🔁 **回测 = 实盘同路径** | 策略执行只此一条 `StrategyEngine.run`;分钟策略逐日回放 +「当日已知」纪律,杜绝未来函数 |
 | 🏛️ **网关居中的开放单体** | 面板密码会话与 Token 网关双通道并行;61 端点契约快照 + CI 守护,SSE 事件流与 MCP 平等开放 |
@@ -282,7 +284,7 @@ flowchart TB
         APPC["外部程序<br/>脚本 · 看板"]
     end
 
-    GW{"开放网关<br/>Token · 六档 scope<br/>限流 120/min · 61 端点契约"}
+    GW{{"开放网关<br/>Token · 六档 scope<br/>限流 120/min · 61 端点契约"}}
 
     API["应用层 · ⚡ FastAPI<br/>REST · SSE 事件流"]
 
@@ -354,7 +356,7 @@ flowchart TB
 | **非路由数据集直连** | 龙虎榜/盘前风向标/交易日历等 fuyao 专有能力不进路由矩阵,由独立服务直连消费——按日 JSON 缓存(历史不可变)、交易日回退、四态降级                                                                                             |
 | **回测执行隔离**     | 回测在 spawn worker 子进程运行,持久 run ID,刷新/切页重连不丢任务;子进程结果消息经锁保护回传                                                                                                                              |
 | **分层缓存**         | enriched 读取时现算指标(存储仅 15 列基础数据,现算 68 列指标与信号)+ 进程内快照缓存;扩展字段按日分区快照,页面即配即用                                                                                                     |
-| **开放网关**         | Token 通道与面板密码会话并行互不影响:认证 → 六档 scope 校验 → 每 Token 滑动窗口限流(默认 120 次/分,O(1) 内存)→ 放行;管理面(数据同步/表结构/设置)永不开放给 Token                                                         |
+| **开放网关**         | Token 通道与面板密码会话并行互不影响:网络门禁(默认仅本机/内网, `API_TOKEN_LOCAL_ONLY=0` 放开) → 认证 → 六档 scope 校验 → 每 Token 滑动窗口限流(默认 120 次/分,O(1) 内存)→ 放行;管理面(数据同步/表结构/设置)永不开放给 Token                                                         |
 | **事件总线**         | 进程内发布/订阅(慢消费者丢旧保新,广播失败不反噬主流程),告警落盘唯一入口已挂接;SSE 流按票据 scope 过滤,票据一次性 60 秒过期                                                                                               |
 | **完全解耦扩展**     | 后端 `app/custom/<包>/` 启动时自动发现、注册独立路由(版本不符或 setup 失败即隔离跳过), 前端 `src/custom/*/extension.tsx` 构建时自动挂载到插槽; 删除目录即整体卸载, 扩展无需改动核心 —— **AI 对话助手**即该机制的参考实现 |
 
@@ -406,6 +408,9 @@ flowchart TB
 
 面板的核心能力不只长在页面上 —— **全部开放成受控接口**,外部程序与 AI 客户端平等消费:
 
+> 🌐 **开放平台门户已上线 → [tsp.shy313.com](https://tsp.shy313.com/)**
+> 浏览 TSP 全部功能 · 注册账户 · 邀请好友 · 创建 API Key · 在线调用开放接口,一个入口直达。
+
 <table>
   <tr>
     <td width="50%" align="center"><b>设置 → 开放接口 · Token 管理</b><br/><sub>明文只显示一次,六档 scope 按需授予</sub></td>
@@ -420,12 +425,15 @@ flowchart TB
 | 能力            | 说明                                                                                                                                                                           |
 | :-------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **API Token**   | `设置 → 开放接口` 创建,明文只显示一次,SHA-256 哈希存储,吊销立即生效                                                                                                            |
+| **网络门禁**    | Token 通道默认仅本机/内网调用,公网一律 403(`API_TOKEN_LOCAL_ONLY=0` 显式放开,远程推荐 SSH 隧道);门禁先于验签,不泄露 Token 有效性也不消耗限流额度                              |
 | **六档 scope**  | `read:market` / `read:ext` / `write:ext` / `read:analysis` / `run:backtest` / `paper:trade`,管理面永不开放给 Token                                                             |
 | **61 端点契约** | `GET /api/openapi.json?tier=a` 机器可读,Postman/代码生成即用;**契约快照测试 + CI 守护**,开放面变更必须显式确认                                                                 |
 | **数据写闭环**  | `write:ext` 程序化写入扩展表行数据(与内置数据同台分析),表结构锁死在管理面                                                                                                      |
 | **SSE 事件流**  | 60 秒一次性票据订阅实时告警推送,票据只继承 scope 不放大权限                                                                                                                    |
 | **MCP 服务器**  | 12 个精选工具,按 Token scope 暴露;模拟盘交易刻意不交给 AI                                                                                                                      |
 | **示例与文档**  | [examples/open-api](./examples/open-api/README.md) 四个零依赖可运行示例 · [docs/features.md → 开放接口](./docs/features.md) · [开放平台设计方案](./docs/open-platform-plan.md) |
+
+> 开放接口面向**本部署的二次开发与个人工具集成**(自有页面、脚本、机器人、MCP 客户端),不作为数据对外分发通道;公网部署默认仅接受内网 Token 调用,详见 [configuration.md → 开放接口网络门禁](./docs/configuration.md#开放接口网络门禁默认仅本机内网)。
 
 ```bash
 # 十行内跑通第一个调用
@@ -455,7 +463,7 @@ curl -H "Authorization: Bearer tsp_xxxx" \
 | **大盘**         | 看板总览(涨跌家数·成交额·涨停连板·情绪雷达) · 指数行情 · 市场环境(regime) · 异动监控                                        |
 | **板块**         | 概念/行业板块盘中轮动、切换事件与资金排名                                                                                   |
 | **我的数据**     | 自选列表(含备注与实时涨跌) · 持仓提醒 · 信号库                                                                              |
-| **策略与因子**   | 策略目录 · 执行选股策略取标的 · 因子目录 · 因子全市场排名                                                                   |
+| **策略与因子**   | 策略目录 · 执行策略取标的 · 因子目录 · 因子全市场排名                                                                   |
 | **扩展内容**     | 扩展数据表(列表·字段·数据日期, 读行支持过滤/排序/日期范围) · 自定义策略与信号                                               |
 | **数据健康**     | 完整性检查(日线/enriched/分钟K 覆盖区间与停更、财务表缺口、单标的滞后) · 同步任务进度                                       |
 | **动作(须确认)** | 生成信号策略(声明式白名单条件, 落库即用) · 运行策略回测 · 加入自选 · 数据补全(盘后管道/财务表/分钟K扩展, 后台执行·单飞去重) |
@@ -492,6 +500,8 @@ docker run -d --name tsp -p 3018:3018 -v ${PWD}/data:/app/data ghcr.io/shy3130/t
 
 **打开 <http://localhost:3018> 即可使用** · 多架构镜像(linux/amd64 · arm64)由 CI 自动发布,本地无需 Python / Node
 
+**还没决定要不要部署?** 先逛逛 **[官网 tsp.shy313.com](https://tsp.shy313.com/)** —— 功能总览 · 账户注册 · API Key 管理
+
 </div>
 
 <br/>
@@ -502,6 +512,7 @@ docker run -d --name tsp -p 3018:3018 -v ${PWD}/data:/app/data ghcr.io/shy3130/t
 | **B · Compose 本地构建**              | 跑自己改过的代码 / 全套挂载 | Docker                                                                               |
 | **C · 本机 AI 代部署**                | 完全不想碰命令行            | 任一本机 AI 编程助手                                                                 |
 | **D · Dev 模式**                      | 二次开发                    | Python ≥ 3.11 · Node ≥ 20 · [uv](https://docs.astral.sh/uv/) · pnpm(`npm i -g pnpm`) |
+| **E · 桌面客户端**                    | 想要原生桌面窗口、免装环境  | Windows 10+ / macOS(Apple Silicon)                                                   |
 
 ### 方式 A:GHCR 现成镜像(免本地构建,多数用户推荐)
 
@@ -566,11 +577,29 @@ cp .env.example .env       # 按需填 TICKFLOW_API_KEY(留空 = None 模式)
 
 自动检查 / 下载依赖、释放端口、同时起前后端。后端 → <http://localhost:3018> · 前端 → <http://localhost:3011>。
 
+### 方式 E:桌面客户端(Windows / macOS)
+
+从 [Releases](https://github.com/shy3130/tick-stock-panel/releases/latest) 下载对应安装包:Windows 双击 `TSP-Setup-x64-*.exe` 按向导安装即可;macOS 下载 `TSP-macos-arm64-*.dmg`。
+
+<details>
+<summary><b>🍎 macOS 安装注意事项(点开查看)</b></summary>
+
+- **仅支持 Apple Silicon(M 系列芯片)**,暂无 Intel 版本。
+- 打开 dmg 后,请先把 **TSP.app 拖入「应用程序(Applications)」再运行**;不要直接在 dmg 挂载窗口里双击运行 —— 挂载卷是只读的,会导致启动即退出。
+- 首次打开会被 macOS Gatekeeper 拦截(安装包暂未做开发者签名与公证):前往 **系统设置 → 隐私与安全性**,下滑到「已阻止使用 "TSP"」→ 点 **仍要打开**,再按提示确认一次。
+- 若提示 **「"TSP" 已损坏,无法打开」**,或完成上一步后仍一闪退出:打开「终端」执行下面的命令,然后再启动(`xattr` 为 macOS 自带命令,作用是移除下载文件上的隔离标记,不会改动系统设置):
+
+```bash
+xattr -dr com.apple.quarantine /Applications/TSP.app
+```
+
+</details>
+
 ### 跑起来后的第一次使用
 
 1. **设置 → 凭据与能力** → 点 **重新检测**,确认档位标签与能力路由矩阵
 2. **设置** → **立即跑盘后管道**:拉日 K + 计算 enriched 表(None / Free 走 free-api,当日数据盘后 1-2 小时可用)
-3. **自选**页加标的 → **选股**页点策略卡片扫描 / 配自定义信号
+3. **自选**页加标的 → **策略**页点策略卡片扫描 / 配自定义信号
 4. **回测**页选策略 + 区间 → 看净值 / 夏普 / 交易明细(SSE 实时进度),结果可导出 CSV、存候选一键复测
 5. **监控中心**配规则,盘中实时弹窗 + 持久化记录;**异动监控**覆盖竞价/盘中/偏移全时段
 6. 配好 AI Key 后,**悬浮球 / ⌘K** 呼出 **AI 对话助手**,直接问「今天市场怎么样」「我的自选表现如何」「我的扩展数据表里有什么」,或让它「生成一个放量站上 20 日线的信号」「检查一下数据完整性」——写操作会先弹确认卡, 你点确认才执行
@@ -613,12 +642,12 @@ PORT=3018                      # 服务端口
 | :------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------- |
 | [docs/deployment.md](./docs/deployment.md)                                                         | 部署方式(Dev / Docker / GH Actions)、老 CPU 兼容、更新代码、访问密码 |
 | [docs/configuration.md](./docs/configuration.md)                                                   | 所有 `.env` 配置项详解(数据源、AI、服务、密码、数据目录)             |
-| [docs/features.md](./docs/features.md)                                                             | 各功能模块详细说明(选股/指标/回测/监控/个股分析/数据扩展/开放接口)   |
+| [docs/features.md](./docs/features.md)                                                             | 各功能模块详细说明(策略/指标/回测/监控/个股分析/数据扩展/开放接口)   |
 | [docs/open-platform-plan.md](./docs/open-platform-plan.md)                                         | 开放平台设计:核心域/扩展域边界、Token 体系、Tier 契约与分期路线      |
 | [mcp-server/README.md](./mcp-server/README.md)                                                     | MCP 服务器配置(AI 客户端接入)与工具清单                              |
 | [examples/open-api](./examples/open-api/README.md)                                                 | 开放接口可运行示例(行情/写入/回测/事件流)                            |
 | [docs/custom-data-source.md](./docs/custom-data-source.md)                                         | 自定义数据源接入、能力路由契约、YAML 配置与 mock 联调示例            |
-| [docs/strategy.md](./docs/strategy.md)                                                             | 策略体系(25 内置策略 + 三种扩展方式 + 文件结构)                      |
+| [docs/strategy.md](./docs/strategy.md)                                                             | 策略体系(全自定义化 + 三种扩展方式 + 文件结构)                      |
 | [docs/strategy-iteration.md](./docs/strategy-iteration.md)                                         | AI 策略迭代协议:台账 / 证据包 / 门槛判定 / 提示词卡片                |
 | [docs/mining.md](./docs/mining.md)                                                                 | 因子与策略挖掘口径、防泄漏、任务隔离和发布边界                       |
 | [docs/market-phase.md](./docs/market-phase.md)                                                     | 市场情绪周期 6 阶段与概念/行业主线识别的口径与设计                   |

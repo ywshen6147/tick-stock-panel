@@ -6,6 +6,12 @@
 
 快照来源与 /api/openapi.json?tier=a 完全同源: app.openapi() 的 paths
 逐 (method, path) 过 api_gateway.required_scope — 规则表是唯一源。
+
+本分支相对上游 v0.3.x 新增 19 个 (method, path), 全部来自 app/api/paper.py 的模拟盘
+AI 扩展面 (llm_status/llm_stats、debate、memory*、conversation*、chat、chat/stream),
+由 api_gateway._RULES 的 ("*", "/api/paper", "paper:trade") 统一开放 —— 模拟盘整体
+本来就是一个 Tier A 面, 新增路由自然进入开放面。这是有意的契约变更, 且**只增不减**,
+对已有二开方无破坏性 (无移除、无方法变更), 因此不需要 major 版本。
 """
 from __future__ import annotations
 
@@ -47,12 +53,33 @@ EXPECTED_OPEN_ENDPOINTS: set[str] = {
     "GET /api/paper/account",
     "POST /api/paper/account",
     "GET /api/paper/accounts",
+    "POST /api/paper/arena/batch_create",
     "POST /api/paper/auto_rules",
     "DELETE /api/paper/auto_rules/{rule_id}",
     "GET /api/paper/auto_rules",
     "POST /api/paper/auto_rules/{rule_id}/enabled",
+    # ↓ 本分支新增 (模拟盘 AI 面: 对话/辩论/记忆/LLM 状态), 见模块 docstring
+    "POST /api/paper/chat",
+    "POST /api/paper/chat/stream",
     "GET /api/paper/compare",
+    "GET /api/paper/conversation",
+    "DELETE /api/paper/conversation",
+    "GET /api/paper/conversation/{turn_id}",
+    "POST /api/paper/debate",
     "POST /api/paper/freeze",
+    "GET /api/paper/llm_stats",
+    "GET /api/paper/llm_status",
+    "GET /api/paper/memory",
+    "GET /api/paper/memory/knowledge",
+    "POST /api/paper/memory/knowledge",
+    "PUT /api/paper/memory/knowledge/{kb_id}",
+    "DELETE /api/paper/memory/knowledge/{kb_id}",
+    "DELETE /api/paper/memory/lessons/{lesson_id}",
+    "POST /api/paper/memory/review",
+    "GET /api/paper/memory/reviews",
+    "GET /api/paper/memory/reviews/{day}",
+    "GET /api/paper/memory/schedule",
+    "PUT /api/paper/memory/schedule",
     "GET /api/paper/nav",
     "POST /api/paper/orders",
     "DELETE /api/paper/orders/{order_id}",

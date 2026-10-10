@@ -57,15 +57,15 @@ def get_settings() -> dict:
     from app.services import preferences
     from app.services.ai_provider import (
         ai_configured,
+        current_ai_context_window,
+        current_ai_max_output_tokens,
         current_ai_model,
+        current_ai_round_checkpoint,
         current_codex_command,
         current_codex_model,
         current_codex_reasoning_effort,
         current_openai_model,
         current_openai_reasoning_effort,
-        current_ai_context_window,
-        current_ai_max_output_tokens,
-        current_ai_round_checkpoint,
     )
 
     key = secrets_store.get_tickflow_key()
@@ -149,7 +149,8 @@ def save_tickflow_key(req: TickflowKeyIn, request: Request) -> dict:
     故自动切到默认付费端点(api.tickflow.org);free 档则清除自定义端点。
     """
     from app.tickflow.policy import (
-        base_tier_name, is_invalid_key,
+        base_tier_name,
+        is_invalid_key,
     )
 
     key = req.api_key.strip()
@@ -277,16 +278,16 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
     from app.services.ai_provider import (
         OPENAI_PROVIDER,
         ai_configured,
+        current_ai_context_window,
+        current_ai_max_output_tokens,
         current_ai_model,
         current_ai_provider,
+        current_ai_round_checkpoint,
         current_codex_command,
         current_codex_model,
         current_codex_reasoning_effort,
         current_openai_model,
         current_openai_reasoning_effort,
-        current_ai_context_window,
-        current_ai_max_output_tokens,
-        current_ai_round_checkpoint,
         normalize_codex_command,
         normalize_codex_model,
         normalize_codex_reasoning_effort,
@@ -772,10 +773,24 @@ def get_data_source(name: str) -> dict:
 
 @router.post("/data-sources")
 def save_data_source(req: CustomSourceIn) -> dict:
-    """创建或更新一个自定义数据源 yaml, 保存后自动 reload。"""
+    """创建或更新一个自定义数据源 yaml, 保存后自动 reload。
+
+    先验后存 (对齐插件 Key 的先探后存语义): 用与加载同一套校验试建临时
+    provider, 不通过直接 400 且不落盘 — 否则 YAML 写入但 load_all 校验失败,
+    源从列表静默消失, 前端还弹"已保存"成功提示 (用户反馈: 全量分钟缺
+    amount 映射被拒, 以为存上了)。
+    """
     from app.data_providers import custom as custom_sources
     config = req.model_dump()
     config["name"] = (config.get("name") or "").lower()
+    probe = None
+    try:
+        probe = custom_sources.create_provider(config)  # 失败自抛 ValueError(含全部校验原因)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        if probe is not None:
+            probe.close()  # 临时探针(仅校验用), 不留连接资源
     try:
         custom_sources.save_config(config["name"], config)
         custom_sources.load_all()
@@ -1272,8 +1287,7 @@ def update_feishu_webhook(req: FeishuWebhookPrefsIn) -> dict:
     - url: 传入空串表示清空配置; 非空则需为合法的飞书自定义机器人地址。
     - secret: 机器人启用了「签名校验」时填密钥, 留空表示不验签。
     """
-    from app.services import preferences
-    from app.services import webhook_adapter
+    from app.services import preferences, webhook_adapter
 
     url = (req.url or "").strip()
     if url and not webhook_adapter.is_valid_feishu_url(url):
@@ -1298,8 +1312,7 @@ def update_wecom_webhook(req: WecomWebhookPrefsIn) -> dict:
     - url: 传入空串表示清空配置; 非空需为合法企业微信群推送 Webhook 地址, 或纯 key。
     - 用户可只填 key (webhook/send?key=xxx 的 xxx 部分), 后端自动补全为完整 URL。
     """
-    from app.services import preferences
-    from app.services import webhook_adapter
+    from app.services import preferences, webhook_adapter
 
     url = (req.url or "").strip()
     if url and not webhook_adapter.is_valid_wecom_url(url):
@@ -1404,8 +1417,7 @@ def test_webhook(req: WebhookTestIn) -> dict:
     未配置 / 地址非法 / 发送失败均返回 HTTP 200 + {ok: False}，
     前端统一读 detail 渲染绿/红，不抛 400。
     """
-    from app.services import preferences
-    from app.services import webhook_adapter
+    from app.services import preferences, webhook_adapter
 
     title = "TickFlow Stock Panel 推送测试"
     body = "如果你看到这条消息，说明推送配置正确 🎉"
@@ -1968,7 +1980,7 @@ def update_review_schedule(req: ReviewScheduleIn, request: Request) -> dict:
     sched = preferences.set_review_schedule(req.enabled, req.hour, req.minute)
 
     # 动态操作 APScheduler job
-    from app.jobs.daily_pipeline import _register_review_job, REVIEW_JOB_ID
+    from app.jobs.daily_pipeline import REVIEW_JOB_ID, _register_review_job
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler:
         if sched["enabled"]:

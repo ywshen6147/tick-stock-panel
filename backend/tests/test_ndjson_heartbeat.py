@@ -2,7 +2,9 @@
 
 背景: AI 分析/复盘端点等 LLM 首包期间流上零字节, 会被代理按空闲超时
 切断连接(前端报裸 network error)。with_heartbeat 在空闲期插入
-{"type":"ping"} 行保活; _openai_client 的 max_retries 让首包前失败可重试。
+{"type":"ping"} 行保活; 首包前失败的**有界重试**由上层
+(ai_provider._run_openai_message_once / _stream_openai + _is_retryable_transport)
+负责, SDK 客户端自身不再重试 (见下方用例)。
 """
 from __future__ import annotations
 
@@ -80,10 +82,30 @@ async def test_with_heartbeat_cancels_pump_on_client_disconnect():
 
 
 def test_openai_client_enables_bounded_retries(monkeypatch):
+    """客户端**不再**自带重试: 有界重试全部收归上层。
+
+    用例 id 保留 (被清单/文档引用), 断言随设计更新为 max_retries == 0。
+
+    设计变更 (本分支主动改的): `_openai_client` 的 max_retries 由 2 → 0。
+    SDK 对 429 无条件重试, 而"余额/额度不足"这类 429 重试毫无意义 —— 充值是人工
+    动作, 1.5 秒后不会变; 实测 2026-10-10 moonshot 余额耗尽时一次调用白跑 3 个
+    请求 (1 原始 + 2 次 SDK 重试), 还把"余额不足"误报成"传输失败"。
+    上层替它承担了有界重试, 且有 SDK 做不到的分流:
+      - `_is_retryable_transport`: 限流 429 可重试, 余额/欠费类 429 不重试;
+      - `_run_openai_message_once` / `_stream_openai`: 覆盖首包前失败与已产出后断流,
+        重试次数由 `_TRANSPORT_MAX_RETRIES` 封顶 (=2, 正是原先 SDK 提供的两次)。
+    上层行为的覆盖见 tests/test_ai_provider.py:
+      test_rate_limit_429_retries_but_quota_429_does_not /
+      test_run_openai_message_once_gives_up_after_bounded_retries /
+      test_stream_openai_retries_when_nothing_yielded /
+      test_stream_openai_does_not_retry_after_partial_output
+    """
     monkeypatch.setattr(
         secrets_store,
         "get_ai_config",
         lambda key, default="": "https://api.deepseek.com/v1" if key == "ai_base_url" else "",
     )
     client = ai_provider._openai_client("test-key", 30.0)
-    assert client.max_retries == 2
+    assert client.max_retries == 0, "重试不得由 SDK 自带(会对余额/欠费类 429 白跑请求)"
+    # 串起"有界": 客户端让出的 2 次重试由上层等量、可测、可分流的有界重试补上
+    assert ai_provider._TRANSPORT_MAX_RETRIES == 2

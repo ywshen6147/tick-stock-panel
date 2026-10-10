@@ -156,6 +156,7 @@ export function Screener() {
   const strategies = useQuery({
     queryKey: [...QK.screenerStrategies('all'), 'all'],
     queryFn: () => api.screenerStrategies(undefined, 'all'),
+    staleTime: 60_000,  // 策略池清单慢变 (与 Paper 同款), 减少切页重拉
   })
 
   // 激活策略自身的执行周期 (决定走缓存还是分钟实时跑)。
@@ -264,12 +265,44 @@ export function Screener() {
     prune(allStrategyIds)
   }, [allStrategyIds, prune, strategies.isError, strategies.isSuccess])
 
-  // 策略文件加载失败时提示用户(避免"策略静默消失"被误判为正常)
+  // 去内置化一次性迁移提示: 后端启动时自动种入默认信号/归档失效策略,
+  // 摘要只在首次见到时提示一次 (localStorage 记录迁移指纹)。
+  const legacyMigration = strategies.data?.legacy_migration
+  useEffect(() => {
+    if (!legacyMigration) return
+    const fingerprint = JSON.stringify(legacyMigration)
+    const key = 'tsp-legacy-migration-v1'
+    try {
+      if (localStorage.getItem(key) === fingerprint) return
+      localStorage.setItem(key, fingerprint)
+    } catch { /* 隐私模式等存储不可用: 退化为每次提示 */ }
+    const parts: string[] = []
+    if (legacyMigration.seeded_signals) {
+      parts.push(`已将 ${legacyMigration.seeded_signals} 个原内置信号转为自定义信号(可在信号库编辑)`)
+    }
+    if (legacyMigration.archived_files?.length) {
+      parts.push(`已归档 ${legacyMigration.archived_files.length} 个无法加载的旧策略文件(位于 data/strategies/*/_archive_unloadable/)`)
+    }
+    if (parts.length) toast(`旧版数据自动迁移完成：${parts.join('；')}`, 'success')
+  }, [legacyMigration])
+
+  // 策略文件加载失败时提示用户(避免"策略静默消失"被误判为正常)。
+  // 多个失败聚合为一条, 避免旧数据目录升级后 (内置模块移除/叠加断链) 刷屏。
   const loadErrors = strategies.data?.load_errors ?? []
   useEffect(() => {
-    for (const e of loadErrors) {
-      toast(`策略「${e.file}」加载失败：${e.error}`, 'error')
+    if (loadErrors.length === 0) return
+    if (loadErrors.length === 1) {
+      toast(`策略「${loadErrors[0].file}」加载失败：${loadErrors[0].error}`, 'error')
+      return
     }
+    const files = loadErrors.slice(0, 3)
+      .map(e => String(e.file).split('/').pop())
+      .join('、')
+    toast(
+      `${loadErrors.length} 个策略文件加载失败（${files}${loadErrors.length > 3 ? ' 等' : ''}）。` +
+      '常见原因：文件引用了已移除的内置模块、或叠加策略的子策略不存在 —— 请在 data/strategies/ 下更新或删除这些文件',
+      'error',
+    )
   }, [loadErrors])
 
   // 进入页面自动跑策略池中的策略，获取命中数 (日线走盘后缓存/渐进式 runAll;
@@ -295,6 +328,12 @@ export function Screener() {
           : null,
       )
       if (data.error) toast(`策略计算失败：${data.error}`, 'error')
+      // 策略池残留的失效 ID (如内置策略移除后的旧数据目录): 后端已跳过,
+      // 这里从池中清掉并提示一次, 空库场景 prune(按有效列表) 清不掉的兜底。
+      if (data.skipped_unknown?.length) {
+        for (const id of data.skipped_unknown) removeFromPool(id)
+        toast(`已跳过 ${data.skipped_unknown.length} 个不存在的策略，并从策略池移除`, 'success')
+      }
       qc.invalidateQueries({ queryKey: ['screener-cached'] })
     },
   })
@@ -642,10 +681,11 @@ export function Screener() {
 
   const batchAdd = useWatchlistBatchAdd()
 
-  // 自选股列表 (用于判断是否在自选中)
+  // 自选列表 (用于判断是否在自选中)
   const watchlist = useQuery({
     queryKey: QK.watchlist,
     queryFn: api.watchlistList,
+    staleTime: 30_000,
   })
   const watchlistSet = useMemo(() => {
     const symbols = watchlist.data?.symbols ?? []
@@ -747,7 +787,7 @@ export function Screener() {
         title="策略"
         subtitle="基于本地 enriched 表 · 毫秒级 SQL"
         right={
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-nowrap overflow-x-auto max-w-full [&>*]:shrink-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             {/* 资产类型切换: 股票 / ETF (分钟策略 asset_types 仅股票, ETF 列表自然不含) */}
             <div className="flex items-center h-7 rounded-btn border border-border overflow-hidden">
               {(['stock', 'etf'] as const).map(t => (
@@ -897,7 +937,20 @@ export function Screener() {
         {cardSize !== 'hidden' && (
         <section>
           {strategies.isLoading && <div className="text-sm text-muted">加载中…</div>}
-          {!strategies.isLoading && displayPool.length === 0 && (
+          {!strategies.isLoading && strategies.isError && (
+            <div className="flex flex-col items-center gap-2 py-4 text-center border border-dashed border-danger/40 rounded-btn">
+              <span className="text-sm text-secondary">策略列表加载失败，请重试；策略池配置本身不受影响。</span>
+              <button
+                type="button"
+                onClick={() => strategies.refetch()}
+                disabled={strategies.isFetching}
+                className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs text-accent transition-colors hover:bg-elevated disabled:opacity-50"
+              >
+                重试
+              </button>
+            </div>
+          )}
+          {!strategies.isLoading && !strategies.isError && displayPool.length === 0 && (
             <div className="text-sm text-muted py-4 text-center border border-dashed border-border rounded-btn">
               {pool.length === 0
                 ? '策略池为空，点击右上角「策略池」按钮添加策略'
@@ -1125,7 +1178,7 @@ export function Screener() {
                 <ScanSearch className="h-7 w-7 text-accent/40" />
               </div>
               <div className="flex flex-col items-center gap-1.5">
-                <span className="text-sm text-secondary">点击策略卡片查看选股结果</span>
+                <span className="text-sm text-secondary">点击策略卡片查看策略结果</span>
                 <span className="text-[11px] text-muted">若提示 enriched 表无数据，请先运行盘后管道</span>
               </div>
             </div>

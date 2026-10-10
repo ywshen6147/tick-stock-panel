@@ -3,54 +3,55 @@ import { useQuery } from '@tanstack/react-query'
 import { PenLine } from 'lucide-react'
 import { api } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
-import { SIGNAL_OPTIONS, cnSignal } from '@/lib/signals'
 
 /** 展示与过滤可选项 (全部可选, 有默认值) */
 interface SignalPickerOptions {
-  /** 渲染尺寸: dialog = 选股弹窗紧凑样式; panel = 回测页设置抽屉样式 */
+  /** 渲染尺寸: dialog = 策略弹窗紧凑样式; panel = 回测页设置抽屉样式 */
   variant?: 'dialog' | 'panel'
+  /** 额外信号选项 (监控页传入盘中信号); 策略/回测不传 — 全部信号来自定义 */
   builtinSignals?: { key: string; label: string }[]
   disabledSignals?: string[]
   disabledSignalHint?: string
   /**
-   * 是否按 kind 过滤自定义信号 (csg_*)。默认 true (选股/回测: 入场区只显示 entry)。
-   * 监控规则页设 false: 报警语义是"命中即报", 不分入场出场, 自定义信号全部显示
-   * (与内置信号一致: builtinSignals 透传时本就不按 kind 过滤)。
+   * 是否按 kind 过滤自定义信号。默认 true (策略/回测: 入场区只显示 entry)。
+   * 监控规则页设 false: 报警语义是"命中即报", 不分入场出场, 信号全部显示。
    */
   filterCustomByKind?: boolean
 }
 
 interface Props {
-  /** 当前选中的信号 ID 列表 */
+  /** 当前选中的信号列名列表 (csg_* / 迁移定义的 signal_*) */
   signals: string[]
   /** 选中变化回调 */
   onChange: (next: string[]) => void
-  /** 买点 / 卖点 — 决定自定义信号的过滤与配色主题 */
+  /** 买点 / 卖点 — 决定信号的过滤与配色主题 */
   kind: 'entry' | 'exit'
   options?: SignalPickerOptions
 }
 
 /**
- * 买卖触发器信号选择 — 选股页弹窗 / 回测页共用。
+ * 买卖触发器信号选择 — 策略页弹窗 / 回测页共用。
  *
- * - 内置信号 (signal_*): 全部展示
- * - 自定义信号 (csg_*): 按 kind 过滤 (entry / exit / both), 除非 filterCustomByKind=false
+ * - 全部信号来自用户定义 (/api/custom-signals), 按解析列名 (csg_* 或迁移
+ *   定义的 signal_*) 作为选中值; 按 kind 过滤 (entry / exit / both),
+ *   除非 filterCustomByKind=false
+ * - builtinSignals 仅在监控页传入 (盘中信号)
  * - **盘中信号 (timeframe=intraday) 一律不列出**: 它们的列名是 csgi_*、只存在于分钟
  *   特征帧; 选股/回测/监控都在**日线帧**上求值, 选中只会得到一个不存在的列
  *   (策略运行报错或条件恒 false)。信号库页面仍会展示它们(带「盘中」徽标)。
- * - entry 蓝色主题, exit 橙色主题; 自定义信号边框配色与内置一致, 右上角 PenLine 角标区分
+ * - entry 蓝色主题, exit 橙色主题; 右上角 PenLine 角标标识可编辑的定义信号
  */
 export function SignalPicker({ signals, onChange, kind, options }: Props) {
-  const { variant = 'panel', builtinSignals, disabledSignals = [], disabledSignalHint, filterCustomByKind = true } = options ?? {}
+  const { variant = 'panel', builtinSignals = [], disabledSignals = [], disabledSignalHint, filterCustomByKind = true } = options ?? {}
   const customSignalsQuery = useQuery({ queryKey: QK.customSignals, queryFn: api.customSignalsList })
 
   const customOptions = useMemo(() => {
     const list = (customSignalsQuery.data?.signals ?? [])
-      .filter(s => s.enabled)
-      .filter(s => s.timeframe !== 'intraday')   // 盘中信号 → csgi_*, 日线帧不可用
+      .filter(s => s.enabled && s.timeframe !== 'intraday')
       .filter(s => !filterCustomByKind || s.kind === kind || s.kind === 'both')
+    // 列名 = 显式 column (迁移定义沿用 signal_*) 或默认 csg_{id}
     const names: Record<string, string> = {}
-    for (const cs of list) names[`csg_${cs.id}`] = cs.name
+    for (const cs of list) names[cs.column ?? `csg_${cs.id}`] = cs.name
     return { list, names }
   }, [customSignalsQuery.data, kind, filterCustomByKind])
 
@@ -71,11 +72,10 @@ export function SignalPicker({ signals, onChange, kind, options }: Props) {
   const btnCls = variant === 'dialog'
     ? 'rounded px-1.5 py-0.5 text-[10px] font-medium border transition-colors cursor-pointer'
     : 'rounded-btn border px-2.5 py-1.5 text-[11px] transition-colors cursor-pointer'
-  const builtinOptions = builtinSignals ?? SIGNAL_OPTIONS.map(key => ({ key, label: cnSignal(key) }))
 
   return (
     <div className="flex flex-wrap gap-1.5">
-      {builtinOptions.map(option => {
+      {builtinSignals.map(option => {
         const disabled = disabledSignals.includes(option.key) && !signals.includes(option.key)
         return (
           <button
@@ -91,13 +91,13 @@ export function SignalPicker({ signals, onChange, kind, options }: Props) {
         )
       })}
       {customOptions.list.map(cs => {
-        const id = `csg_${cs.id}`
+        const id = cs.column ?? `csg_${cs.id}`
         return (
           <button
             key={id}
             type="button"
             onClick={() => toggle(id)}
-            title="自定义信号"
+            title="信号库定义, 可在信号库编辑"
             className={`${btnCls} relative ${signals.includes(id) ? active : idle}`}
           >
             {customOptions.names[id]}

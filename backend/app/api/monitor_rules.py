@@ -126,32 +126,36 @@ def get_options(request: Request):
     """返回可选字段、信号列、运算符、枚举,供前端表单使用。"""
     from app.indicators.pipeline import ENRICHED_COLUMNS
     from app.services.kline_sync import intraday_monitor_support
-    from app.strategy.custom_signals import ALLOWED_FIELDS, INTRADAY_PREFIX, load_all as load_csg
+    from app.strategy.custom_signals import (
+        ALLOWED_FIELDS,
+        intraday_column_name,
+        resolve_column,
+    )
+    from app.strategy.custom_signals import (
+        load_all as load_csg,
+    )
 
     # 阈值字段 (带中文标签)
     threshold_fields = [
         {"key": f, "label": ENRICHED_COLUMNS.get(f, f)}
         for f in sorted(ALLOWED_FIELDS)
     ]
-    # 内置信号列 (布尔, 用于 op=truth)
+    # 盘中信号列 (布尔, 用于 op=truth); 日线信号列已全部定义驱动 → custom_signals
     builtin_signals = [
-        {"key": k, "label": v}
-        for k, v in ENRICHED_COLUMNS.items()
-        if k.startswith("signal_")
-    ]
-    builtin_signals.extend(
         {"key": key, "label": label}
         for key, label in INTRADAY_SIGNAL_LABELS.items()
-    )
-    # 自定义信号列: 日线 csg_ / 盘中 csgi_ (按信号 timeframe 取正确前缀)
+    ]
+    # 自定义信号列 (csg_ 及携带显式 signal_* 列名的迁移定义)
     custom_sigs = []
     try:
         for cs in load_csg(_data_dir(request)):
             if cs.get("enabled") is not False:
-                is_intraday = str(cs.get("timeframe") or "").strip().lower() == "intraday"
-                prefix = INTRADAY_PREFIX if is_intraday else "csg_"
                 custom_sigs.append({
-                    "key": f"{prefix}{cs['id']}",
+                    "key": (
+                        intraday_column_name(cs["id"])
+                        if cs.get("timeframe") == "intraday"
+                        else resolve_column(cs)
+                    ),
                     "label": cs.get("name", cs["id"]),
                 })
     except Exception:
@@ -571,6 +575,7 @@ def trigger_ladder(request: Request):
     让用户看到真实的预警通知。绕过 cooldown 强制触发。
     """
     import time
+
     from app.services import alert_store
 
     repo = request.app.state.repo
