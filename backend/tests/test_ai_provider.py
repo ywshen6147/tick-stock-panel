@@ -18,6 +18,14 @@ from app.services.ai_provider import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_rejected_params_cache():
+    """参数降级缓存是进程级状态 → 每个用例前后清空，避免跨用例互相污染。"""
+    ai_provider.reset_rejected_params_cache()
+    yield
+    ai_provider.reset_rejected_params_cache()
+
+
 def test_normalize_openai_base_url_adds_v1_for_root_gateway():
     assert normalize_openai_base_url("http://ai.zedbox.cn:8080") == "http://ai.zedbox.cn:8080/v1"
 
@@ -393,7 +401,7 @@ async def test_generate_ai_text_clamps_max_tokens_to_config_cap(monkeypatch):
     monkeypatch.setattr(ai_provider, "current_ai_max_output_tokens", lambda: 3000)
     monkeypatch.setattr(ai_provider, "current_ai_context_window", lambda: 64000)
 
-    async def fake_run(messages, *, temperature, max_tokens, timeout):
+    async def fake_run(messages, *, temperature, max_tokens, timeout, model=None):
         captured["max_tokens"] = max_tokens
         return "ok"
 
@@ -413,7 +421,7 @@ async def test_generate_ai_text_default_cap_and_none_passthrough(monkeypatch):
     monkeypatch.setattr(ai_provider, "current_ai_max_output_tokens", lambda: 4000)
     monkeypatch.setattr(ai_provider, "current_ai_context_window", lambda: 64000)
 
-    async def fake_run(messages, *, temperature, max_tokens, timeout):
+    async def fake_run(messages, *, temperature, max_tokens, timeout, model=None):
         captured["max_tokens"] = max_tokens
         return "ok"
 
@@ -718,3 +726,239 @@ async def test_codex_exec_args_exclude_ephemeral(monkeypatch):
     assert "--ephemeral" not in args
     assert "exec" in args and "--skip-git-repo-check" in args
     assert args[args.index("--model") + 1] == "gpt-5.6-sol"
+
+
+# ── 参数降级缓存 + 传输失败整体重试 ────────────────────────────────────
+# 回归背景: 2026-10-09 模拟盘收盘复盘失败 —— kimi-k2.7-code 只接受 temperature=1,
+# 每次复盘先吃一个 400 再重试; 另一次是长请求(65s)中途被上游断连, SDK 两次重试
+# 用尽后整体失败, 面板显示「AI 服务连接失败」。
+def _status_error(cls, status: int):
+    resp = httpx.Response(
+        status,
+        json={"error": {"message": "x"}},
+        request=httpx.Request("POST", "https://e.com/v1/chat/completions"),
+    )
+    return cls("e", response=resp, body={"error": {"message": "x"}})
+
+
+def test_is_retryable_transport_excludes_param_400s():
+    """400/401/404 不可整体重试; 429/5xx/连接类才可。
+
+    关键: `_is_openai_transport_error` 对任何 openai.APIError 都是 True(含 400),
+    直接拿它当重试判据会让参数类 400 白跑一遍, 所以必须用独立判据。
+    """
+    cases = [
+        (400, openai.BadRequestError, False),
+        (401, openai.AuthenticationError, False),
+        (404, openai.NotFoundError, False),
+        (429, openai.RateLimitError, True),
+        (500, openai.InternalServerError, True),
+        (503, openai.InternalServerError, True),
+    ]
+    for status, cls, expected in cases:
+        exc = _status_error(cls, status)
+        assert ai_provider._is_retryable_transport(exc) is expected, status
+        # 对照: 旧判据对 400 也返回 True —— 正因如此不能复用
+        assert ai_provider._is_openai_transport_error(exc) is True
+
+    conn = openai.APIConnectionError(request=httpx.Request("POST", "https://e.com"))
+    assert ai_provider._is_retryable_transport(conn) is True
+    assert ai_provider._is_retryable_transport(ValueError("x")) is False
+
+
+def test_rate_limit_429_retries_but_quota_429_does_not():
+    """429 要分两种: 限流可重试; 余额/额度不足重试无意义(充值不是秒级动作)。
+
+    回归: 2026-10-10 moonshot 余额耗尽返回 429 exceeded_current_quota_error,
+    被当成"传输失败"整体重试 → 白跑一次请求, 且错误信息失真。
+    """
+    def _429(body: dict):
+        resp = httpx.Response(
+            429, json=body,
+            request=httpx.Request("POST", "https://api.moonshot.cn/v1/chat/completions"),
+        )
+        return openai.RateLimitError("rate limited", response=resp, body=body)
+
+    quota = _429({"error": {
+        "message": "Your account org-x is suspended due to insufficient balance, "
+                   "please recharge your account or check your plan and billing details",
+        "type": "exceeded_current_quota_error",
+    }})
+    assert ai_provider._is_retryable_transport(quota) is False
+
+    plain_limit = _429({"error": {"message": "rate limit exceeded, retry later",
+                                  "type": "rate_limit_error"}})
+    assert ai_provider._is_retryable_transport(plain_limit) is True
+
+
+def test_rejected_param_cache_skips_repeat_400(monkeypatch):
+    """识别出 temperature 被拒后, 后续同类调用不再发送该参数(省一次注定 400 的往返)。"""
+    monkeypatch.setattr(ai_provider, "current_ai_model", lambda: "kimi-k2.7-code")
+    monkeypatch.setattr(
+        secrets_store, "get_ai_config",
+        lambda key, default=None: "https://api.moonshot.cn/v1" if key == "ai_base_url" else default,
+    )
+
+    resp = httpx.Response(
+        400,
+        json={"error": {"message": "invalid temperature: only 1 is allowed for this model"}},
+        request=httpx.Request("POST", "https://api.moonshot.cn/v1/chat/completions"),
+    )
+    exc = openai.BadRequestError(
+        "bad", response=resp,
+        body={"error": {"message": "invalid temperature: only 1 is allowed for this model"}},
+    )
+    kwargs = {"max_tokens": 1000, "temperature": 0.2}
+    assert ai_provider._openai_retry_kwargs(exc, kwargs) == {"max_tokens": 1000}
+    assert kwargs == {"max_tokens": 1000, "temperature": 0.2}  # 入参不被改写
+
+    # 同一模型 + 同一端点: 直接不再带 temperature
+    same = ai_provider._openai_kwargs(
+        temperature=0.2, max_tokens=1000,
+        model="kimi-k2.7-code", base_url="https://api.moonshot.cn/v1",
+    )
+    assert "temperature" not in same and same["max_tokens"] == 1000
+    assert ai_provider.rejected_params_snapshot()[
+        "https://api.moonshot.cn/v1 kimi-k2.7-code"
+    ] == ["temperature"]
+
+    # 换模型/端点: 不被误伤, 仍带 temperature
+    other = ai_provider._openai_kwargs(
+        temperature=0.2, max_tokens=1000,
+        model="deepseek-chat", base_url="https://api.deepseek.com/v1",
+    )
+    assert other["temperature"] == 0.2
+
+
+def _fake_client(factory):
+    """把 ai_provider._openai_client 换成返回伪客户端(chat.completions.create=factory)。"""
+    class _Completions:
+        async def create(self, **kwargs):
+            return await factory(kwargs)
+
+    class _Client:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_Completions())
+
+    return _Client()
+
+
+@pytest.mark.asyncio
+async def test_run_openai_message_once_retries_transport_failure_once(monkeypatch):
+    """长请求中途断连: 在 SDK 重试之外再整体重试一次(非流式无部分产出, 安全)。"""
+    monkeypatch.setattr(ai_provider, "_TRANSPORT_RETRY_DELAY_S", 0)
+    monkeypatch.setattr(secrets_store, "get_ai_key", lambda: "sk-test")
+    monkeypatch.setattr(ai_provider, "current_ai_model", lambda: "m1")
+    attempts: list[dict] = []
+
+    async def _create(kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise openai.APIConnectionError(request=httpx.Request("POST", "https://e.com"))
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None))]
+        )
+
+    monkeypatch.setattr(ai_provider, "_openai_client", lambda key, timeout: _fake_client(_create))
+
+    msg = await ai_provider._run_openai_message_once(
+        [{"role": "user", "content": "hi"}], temperature=None, max_tokens=None, timeout=30,
+    )
+    assert msg.content == "ok"
+    assert len(attempts) == 2, "传输类失败应整体重试一次"
+
+
+@pytest.mark.asyncio
+async def test_run_openai_message_once_gives_up_after_bounded_retries(monkeypatch):
+    """整体重试是有界的: 连续失败仍要抛出可读错误, 不能无限重试。
+
+    client 的 max_retries=0（重试策略收归上层）, 所以这里须覆盖原先 SDK 的两次重试:
+    共 1 次原始 + 2 次整体重试 = 3 次尝试。
+    """
+    monkeypatch.setattr(ai_provider, "_TRANSPORT_RETRY_DELAY_S", 0)
+    monkeypatch.setattr(secrets_store, "get_ai_key", lambda: "sk-test")
+    monkeypatch.setattr(ai_provider, "current_ai_model", lambda: "m1")
+    calls = []
+
+    async def _create(kwargs):
+        calls.append(1)
+        raise openai.APIConnectionError(request=httpx.Request("POST", "https://e.com"))
+
+    monkeypatch.setattr(ai_provider, "_openai_client", lambda key, timeout: _fake_client(_create))
+
+    with pytest.raises(RuntimeError, match="连接失败"):
+        await ai_provider._run_openai_message_once(
+            [{"role": "user", "content": "hi"}], temperature=None, max_tokens=None, timeout=30,
+        )
+    assert len(calls) == 1 + ai_provider._TRANSPORT_MAX_RETRIES, "原始 1 次 + 有界的整体重试"
+
+
+@pytest.mark.asyncio
+async def test_stream_openai_retries_when_nothing_yielded(monkeypatch):
+    """流建立失败 → 未产出任何内容, 可以整体重试一次。"""
+    monkeypatch.setattr(ai_provider, "_TRANSPORT_RETRY_DELAY_S", 0)
+    monkeypatch.setattr(secrets_store, "get_ai_key", lambda: "sk-test")
+    monkeypatch.setattr(ai_provider, "current_ai_model", lambda: "m1")
+    monkeypatch.setattr(
+        secrets_store, "get_ai_config",
+        lambda key, default=None: "https://e.com/v1" if key == "ai_base_url" else default,
+    )
+    calls = []
+
+    async def _create(kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise openai.APIConnectionError(request=httpx.Request("POST", "https://e.com"))
+
+        async def _gen():
+            yield _stream_chunk(content="你好")
+            yield _stream_chunk(finish_reason="stop")
+
+        return _gen()
+
+    monkeypatch.setattr(ai_provider, "_openai_client", lambda key, timeout: _fake_client(_create))
+
+    pieces = [
+        piece
+        async for piece in ai_provider._stream_openai(
+            [{"role": "user", "content": "hi"}],
+            temperature=None, max_tokens=None, timeout=30, prefer_final_answer=False,
+        )
+    ]
+    assert pieces == ["你好"]
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_openai_does_not_retry_after_partial_output(monkeypatch):
+    """已产出内容后断流**不能**重试 —— 否则调用方会看到重复文本。"""
+    monkeypatch.setattr(ai_provider, "_TRANSPORT_RETRY_DELAY_S", 0)
+    monkeypatch.setattr(secrets_store, "get_ai_key", lambda: "sk-test")
+    monkeypatch.setattr(ai_provider, "current_ai_model", lambda: "m1")
+    monkeypatch.setattr(
+        secrets_store, "get_ai_config",
+        lambda key, default=None: "https://e.com/v1" if key == "ai_base_url" else default,
+    )
+    calls = []
+
+    async def _create(kwargs):
+        calls.append(1)
+
+        async def _gen():
+            yield _stream_chunk(content="半截")
+            raise openai.APIConnectionError(request=httpx.Request("POST", "https://e.com"))
+
+        return _gen()
+
+    monkeypatch.setattr(ai_provider, "_openai_client", lambda key, timeout: _fake_client(_create))
+
+    with pytest.raises(RuntimeError, match="连接失败"):
+        async for _ in ai_provider._stream_openai(
+            [{"role": "user", "content": "hi"}],
+            temperature=None, max_tokens=None, timeout=30, prefer_final_answer=False,
+        ):
+            pass
+    assert len(calls) == 1, "已产出内容时不得重试"
+
+
+

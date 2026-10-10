@@ -621,8 +621,30 @@ def set_review_schedule(enabled: bool, hour: int, minute: int) -> dict:
     return {"enabled": bool(enabled), "hour": h, "minute": m}
 
 
-MINING_BUDGET_PROFILES = frozenset({"balanced", "strict"})
+# ===== 模拟盘智能体「每日收盘复盘」调度 =====
+# 与大盘复盘 (review_schedule) 独立: 大盘复盘生成市场报告; 本项让模拟盘智能体
+# 复盘自己的交易 → 写记忆/知识库 → 反哺次日决策。默认开启 (15:35, 盘后管道之后)。
+def get_paper_review_schedule() -> dict:
+    """模拟盘每日复盘调度 {"enabled": True, "hour": 15, "minute": 35}。"""
+    d = load().get("paper_review_schedule", {"enabled": True, "hour": 15, "minute": 35})
+    return {
+        "enabled": bool(d.get("enabled", True)),
+        "hour": int(d.get("hour", 15)),
+        "minute": int(d.get("minute", 35)),
+    }
 
+
+def set_paper_review_schedule(enabled: bool, hour: int, minute: int) -> dict:
+    """保存模拟盘复盘调度。强制时间下限 15:00 (A股收盘后才可复盘)。"""
+    h = max(0, min(23, int(hour)))
+    m = max(0, min(59, int(minute)))
+    if h * 60 + m < 15 * 60:
+        h, m = 15, 0
+    save({"paper_review_schedule": {"enabled": bool(enabled), "hour": h, "minute": m}})
+    return {"enabled": bool(enabled), "hour": h, "minute": m}
+
+
+MINING_BUDGET_PROFILES = frozenset({"balanced", "strict"})
 
 def get_mining_schedule() -> dict:
     """返回周度自动 mining 配置。历史配置缺字段时默认关闭。"""

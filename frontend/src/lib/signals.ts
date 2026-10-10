@@ -7,6 +7,30 @@
 
 export type SignalKind = 'entry' | 'exit' | 'both'
 
+/**
+ * 条件右值归一化 — 后端 `right` 允许两种形态:
+ *   - `"field:xxx"` 字段引用
+ *   - **数字常量**（历史定义与盘中信号直接写数字，如 `0.03`、`2`、`-0.03`）
+ *
+ * 前端渲染/编辑必须走这两个助手，**不能直接 `right.startsWith(...)`** ——
+ * 数字没有 startsWith，会抛 `TypeError: c.right.startsWith is not a function`
+ * 让整个信号库页面崩掉（实测 15 个「海平盘中信号」里 13 个含数字右值）。
+ */
+export function isFieldRef(right: unknown): right is string {
+  return typeof right === 'string' && right.startsWith('field:')
+}
+
+/** 字段引用的字段名；非字段引用返回 ''。 */
+export function fieldRefName(right: unknown): string {
+  return isFieldRef(right) ? right.slice('field:'.length) : ''
+}
+
+/** 常量右值的显示/编辑文本（数字 → 字符串；空值 → ''）。 */
+export function rightConstantText(right: unknown): string {
+  if (right === null || right === undefined) return ''
+  return String(right)
+}
+
 export interface BuiltinSignalDefinition {
   id: string
   name: string

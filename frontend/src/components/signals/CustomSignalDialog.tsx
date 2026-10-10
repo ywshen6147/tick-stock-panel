@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowRight, Loader2, Plus, Save, Search, Sparkles, X } from 'lucide-react'
 import { api, type CustomSignal, type CustomSignalCondition, type CustomSignalFieldGroup } from '@/lib/api'
+import { isFieldRef, fieldRefName, rightConstantText } from '@/lib/signals'
 import { QK } from '@/lib/queryKeys'
 import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
 
@@ -90,7 +91,7 @@ export function CustomSignalDialog({ open, signal, defaultKind = 'exit', onClose
       if (!d.name.trim()) throw new Error('请输入信号名称')
       if (d.conditions.length === 0) throw new Error('至少需要一个条件')
       for (const c of d.conditions) {
-        if (!c.left || !c.op || c.right === '') throw new Error('条件填写不完整')
+        if (!c.left || !c.op || rightConstantText(c.right) === '') throw new Error('条件填写不完整')
       }
       return api.customSignalSave(d)
     },
@@ -211,7 +212,7 @@ export function CustomSignalDialog({ open, signal, defaultKind = 'exit', onClose
 
                       {/* 右操作数: 字符串字段为文本字面量; 其余为 前N日(仅字段) + 字段/常量(弹出选择) */}
                       {isStr ? (
-                        <input type="text" value={c.right} onChange={e => updateCond(i, { right: e.target.value })}
+                        <input type="text" value={rightConstantText(c.right)} onChange={e => updateCond(i, { right: e.target.value })}
                           placeholder="概念/行业名, 如 AI" maxLength={64}
                           className="flex-1 min-w-0 h-7 px-1.5 rounded bg-base border border-border text-[11px] text-foreground focus:outline-none focus:border-accent/50" />
                       ) : (
@@ -458,9 +459,9 @@ function RightValueInput({ cond, fields, groups, maxDays, onChangeRight, onChang
   onChangeRight: (v: string) => void
   onChangeDays: (v: number) => void
 }) {
-  const isField = cond.right.startsWith('field:')
-  const fieldValue = isField ? cond.right.slice(6) : ''
-  const numValue = isField ? '' : cond.right
+  const isField = isFieldRef(cond.right)
+  const fieldValue = fieldRefName(cond.right)
+  const numValue = isField ? '' : rightConstantText(cond.right)
 
   return (
     <div className="flex items-center gap-1 flex-1 min-w-0">

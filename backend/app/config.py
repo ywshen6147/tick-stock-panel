@@ -104,6 +104,12 @@ class Settings(BaseSettings):
     ai_context_window: int = 128000
     # AI 助手工具轮次检查点: 连续 N 轮工具调用未完成时弹「继续/停止」卡; 0=不检查。
     ai_round_checkpoint: int = 100
+    # ── 分组模型: 不同环节可用不同模型（空串 = 跟随 ai_model）──────────────
+    # 对话要快、分析要稳、策略生成要强, 单一模型难以同时最优;
+    # 推理型模型慢且贵, 用在轻量环节是浪费。由「设置 → AI」写入 secrets.json。
+    ai_model_chat: str = ""          # 对话/问答（含模拟盘「我的提问」）
+    ai_model_analysis: str = ""      # 概念轮动 / 行业 / 大盘复盘 / 个股 / 财务 分析
+    ai_model_strategy: str = ""      # AI 选股 / 策略生成 / 迭代
 
     # Server
     host: str = "0.0.0.0"

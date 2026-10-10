@@ -16,8 +16,14 @@ import { fmtPct, priceColorClass } from '@/lib/format'
 import { boardTag } from '@/components/stock-table/primitives'
 import { PageHeader } from '@/components/PageHeader'
 import { Modal } from '@/components/Modal'
+import { ModelSelect } from '@/components/ModelSelect'
+import { PaperMemoryPanel } from '@/components/paper/PaperMemoryPanel'
+import { PaperAgentChat } from '@/components/paper/PaperAgentChat'
 
 const ACC_STORAGE_KEY = 'paper.account'
+
+// 供「海平模型 / 四派顾问模型」输入框下拉的可选模型（datalist: 可选可手打）。
+// 已用真实 Key 实测通过的 ID —— 火山 Agent Plan 13 个 + DeepSeek 官方 3 个。
 
 const ORDER_TYPE_LABEL: Record<string, string> = {
   market: '即时',
@@ -907,9 +913,14 @@ function AutoRulesPanel({ acc }: { acc: string }) {
   const [draft, setDraft] = useState({
     interval: '300', maxOrder: '100000', maxDaily: '200000', maxSell: '200000', symbols: '',
     stopLoss: '3', pAddHalf: '', pReduceHalf: '', pFull: '', pExitAll: '',
+    // 分组模型: 空串 = 跟随全局 AI 设置（下拉可选, 也可手打任意模型 ID）
+    model: '', debateModel: '', reviewModel: '',
+    // 四派逐派模型（空 = 回落四派统一）
+    mCaishen: '', mChanlun: '', mCanslim: '', mKxian: '',
   })
   const symKey = (llm?.symbols ?? []).join(',')
   const pl = llm?.price_levels
+  const globalModel = llm?.ai_model_default || llm?.ai_model || ''
   useEffect(() => {
     if (!llm) return
     const nz = (v?: number | null) => (v && v > 0 ? String(v) : '')
@@ -924,6 +935,13 @@ function AutoRulesPanel({ acc }: { acc: string }) {
       pReduceHalf: nz(pl?.reduce_half),
       pFull: nz(pl?.full),
       pExitAll: nz(pl?.exit_all),
+      model: llm.model ?? '',
+      debateModel: llm.debate?.model ?? '',
+      reviewModel: llm.review_model ?? '',
+      mCaishen: llm.debate?.models?.caishen ?? '',
+      mChanlun: llm.debate?.models?.chanlun ?? '',
+      mCanslim: llm.debate?.models?.canslim ?? '',
+      mKxian: llm.debate?.models?.kxian ?? '',
     })
   }, [llm?.interval_seconds, llm?.max_order_amount, llm?.max_daily_amount,
       llm?.max_daily_sell_amount, symKey, llm,
@@ -943,6 +961,14 @@ function AutoRulesPanel({ acc }: { acc: string }) {
       llm_price_reduce_half: Number(draft.pReduceHalf) || 0,
       llm_price_full: Number(draft.pFull) || 0,
       llm_price_exit_all: Number(draft.pExitAll) || 0,
+      // 分组模型: 空串 = 跟随全局 AI 设置（海平终判 / 四派顾问可各用不同模型）
+      llm_model: draft.model.trim(),
+      llm_debate_model: draft.debateModel.trim(),
+      llm_review_model: draft.reviewModel.trim(),
+      llm_debate_model_caishen: draft.mCaishen.trim(),
+      llm_debate_model_chanlun: draft.mChanlun.trim(),
+      llm_debate_model_canslim: draft.mCanslim.trim(),
+      llm_debate_model_kxian: draft.mKxian.trim(),
     }, acc),
     onSuccess: refreshLlm,
   })
@@ -1028,6 +1054,43 @@ function AutoRulesPanel({ acc }: { acc: string }) {
               <span className="text-[10px] text-muted">标的池(逗号分隔, 留空跟随持仓+自选)</span>
               <input className={inputCls} value={draft.symbols} placeholder="688553.SH" onChange={e => setDraft({ ...draft, symbols: e.target.value })} />
             </label>
+            {/* ── 分组模型: 海平(决策/终判) 与 四派顾问 各用哪个模型 ── */}
+            {/* 用 ModelSelect(真下拉) 而非 input+datalist: 已填值的字段在 datalist 下会被
+                当前内容过滤成一条, 点开无法选别的模型（实测用户反馈过）。 */}
+            <label className="block">
+              <span className="text-[10px] text-muted">海平模型(留空 = 跟随全局)</span>
+              <ModelSelect value={draft.model} onChange={v => setDraft({ ...draft, model: v })}
+                fallbackLabel={`跟随全局（${globalModel || '未配置'}）`} className="mt-0.5 w-full" />
+            </label>
+            <label className="block">
+              <span className="text-[10px] text-muted">四派顾问模型(留空 = 跟随全局)</span>
+              <ModelSelect value={draft.debateModel} onChange={v => setDraft({ ...draft, debateModel: v })}
+                fallbackLabel={`跟随全局（${globalModel || '未配置'}）`} className="mt-0.5 w-full" />
+            </label>
+            <label className="block">
+              <span className="text-[10px] text-muted">收盘复盘模型(留空 = 跟随分析组)</span>
+              <ModelSelect value={draft.reviewModel} onChange={v => setDraft({ ...draft, reviewModel: v })}
+                fallbackLabel={`跟随分析组/全局（${globalModel || '未配置'}）`} className="mt-0.5 w-full" />
+            </label>
+            {/* ── 四派顾问逐派模型（留空 = 回落到上面的「四派顾问模型」，再回落全局）── */}
+            {([
+              ['蔡森·多空转折', 'mCaishen'],
+              ['缠论·走势实战', 'mChanlun'],
+              ['笑傲股市 CAN SLIM', 'mCanslim'],
+              ['K线战法', 'mKxian'],
+            ] as const).map(([label, key]) => (
+              <label className="block" key={key}>
+                <span className="text-[10px] text-muted">{label}(留空 = 用四派统一)</span>
+                <ModelSelect value={draft[key]} onChange={v => setDraft(d => ({ ...d, [key]: v }))}
+                  fallbackLabel={`用四派统一（${draft.debateModel.trim() || globalModel || '全局'}）`}
+                  className="mt-0.5 w-full" />
+              </label>
+            ))}
+          </div>
+          <div className="mt-1 text-[10px] leading-relaxed text-muted/80">
+            分组模型：<b>海平</b>用于盘中决策与辩论终判，<b>四派顾问</b>用于五派辩论（一轮 12 次调用）。
+            留空即跟随全局 AI 设置（当前 <span className="font-mono">{globalModel || '未配置'}</span>）。
+            建议四派用快模型（如 <span className="font-mono">doubao-seed-2.0-lite</span>）、海平用强模型（如 <span className="font-mono">deepseek-v4-pro</span>）。
           </div>
           {/* 硬止损与日卖上限的口径提示（含持仓规模对照，便于复核限额是否合理）*/}
           <div className="mt-1 text-[10px] leading-relaxed text-muted/80">
@@ -1355,6 +1418,9 @@ export function Paper() {
   const qc = useQueryClient()
   const [tab, setTab] = useState<'orders' | 'trades'>('orders')
   const [accId, setAccIdState] = useState(() => localStorage.getItem(ACC_STORAGE_KEY) || 'default')
+  // 页面视图: 交易台(下单/持仓/订单) 或 智能体(对话记录 + 记忆复盘)。
+  // 智能体面板原来只放在右列最底部(窄屏会堆到整页末尾), 很难发现 → 提到顶部切换。
+  const [view, setView] = useState<'trade' | 'agent'>('trade')
   // 新建账户草稿 id: 非空 = 正在创建。点「+」只进入草稿态, 不动 accId / localStorage,
   // 取消即丢弃; 旧实现直接把生成的 id 写进 accId, 刷新后卡在无主向导上无法退出。
   const [draftId, setDraftId] = useState<string | null>(null)
@@ -1490,6 +1556,18 @@ export function Paper() {
         }
         right={
           <div className="flex items-center gap-2">
+            <div className="inline-flex overflow-hidden rounded-btn border border-border" title="交易台：下单/持仓/订单 · 智能体：看它和模型的对话、复盘与记忆">
+              {([['trade', '交易台'], ['agent', '智能体']] as const).map(([k, label]) => (
+                <button
+                  key={k}
+                  onClick={() => setView(k)}
+                  className={cn('px-2.5 py-1 text-[11px] transition-colors',
+                    view === k ? 'bg-accent/15 font-medium text-accent' : 'text-muted hover:text-secondary')}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
             <div className="flex items-center gap-1.5">
               <select
                 value={accId}
@@ -1549,7 +1627,16 @@ export function Paper() {
           />
         </div>
 
-        <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[1fr_320px]">
+        {/* 智能体视图: 对话记录 + 提问 + 记忆/复盘。
+            与「交易台」互斥切换; 交易台用 hidden 保留挂载, 避免切换时查询重建。 */}
+        {view === 'agent' && (
+          <div className="mt-4 grid grid-cols-1 items-start gap-4 xl:grid-cols-2">
+            <PaperAgentChat acc={accId} />
+            <PaperMemoryPanel acc={accId} />
+          </div>
+        )}
+
+        <div className={cn('mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[1fr_320px]', view === 'agent' && 'hidden')}>
           {/* 左列: 净值 + 持仓 + 流水 */}
           <div className="min-w-0 space-y-4">
             <div className="rounded-card border border-border bg-surface p-4">
@@ -1744,3 +1831,6 @@ export function Paper() {
     </div>
   )
 }
+
+
+

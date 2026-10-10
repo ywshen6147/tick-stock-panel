@@ -444,3 +444,38 @@ def test_status_endpoint_without_service():
     resp = client.get("/api/settings/minute-refresh/status")
     assert resp.status_code == 200
     assert resp.json() == {"available": False}
+
+
+# ── 主分区 vs 合成目录 (stocksdk 实时快照合成源) ─────────────────────
+
+
+def test_writes_main_partition_tickflow_true(tmp_path, monkeypatch):
+    """TickFlow 全量分钟源 → 写 kline_minute 主分区 (真实分钟K)。"""
+    svc = _svc(tmp_path, monkeypatch, full_minute_provider="tickflow", custom=None)
+    assert svc.writes_main_partition() is True
+    assert svc._minute_dir() == _FakeRepo(["x"]).store.data_dir / "kline_minute"
+    assert svc.status()["writes_main_partition"] is True
+
+
+def test_writes_main_partition_custom_source_false(tmp_path, monkeypatch):
+    """自定义合成源 (stocksdk 实时快照) → 写独立目录 kline_minute_rt, 不碰主分区。"""
+    class _P:  # noqa: D401 — fake provider
+        def get_intraday_latest(self, count=3):
+            return pl.DataFrame()
+
+    svc = _svc(tmp_path, monkeypatch, full_minute_provider="stocksdk", custom=_P())
+    assert svc.writes_main_partition() is False
+    assert svc._minute_dir().name == "kline_minute_rt"
+    assert svc.status()["writes_main_partition"] is False
+
+
+def test_minute_dir_custom_source_not_main_partition(tmp_path, monkeypatch):
+    """合成源落盘目录必须与主分区不同 (避免合成K覆盖真实分钟K)。"""
+    class _P:  # noqa: D401 — fake provider
+        def get_intraday_latest(self, count=3):
+            return pl.DataFrame()
+
+    svc = _svc(tmp_path, monkeypatch, full_minute_provider="stocksdk", custom=_P())
+    minute_dir = svc._minute_dir()
+    assert str(minute_dir).endswith("kline_minute_rt")
+    assert "kline_minute_rt" not in str(_FakeRepo(["x"]).store.data_dir / "kline_minute")

@@ -232,6 +232,16 @@ def list_accounts(data_dir: Path) -> list[dict]:
     return out
 
 
+# 四派顾问的逐派模型设置键（与 paper_personas.ANALYSTS 的 id 一一对应）。
+# 故意用字面量而不 import paper_personas: 避免 strategy 包内循环依赖。
+_DEBATE_ANALYST_MODEL_KEYS: tuple[str, ...] = (
+    "llm_debate_model_caishen",
+    "llm_debate_model_chanlun",
+    "llm_debate_model_canslim",
+    "llm_debate_model_kxian",
+)
+
+
 def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fields) -> dict:
     """更新账户设置 (涨跌停排队 / 费用三参数 / 跟单模式); 未知字段忽略。返回更新后账户。
 
@@ -289,6 +299,30 @@ def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fiel
         # 不一致配置把无关的设置更新也一并拒掉）。
         if any(k in fields and fields[k] is not None for k, _ in _PRICE_LEVEL_ORDER):
             _validate_price_levels(acc)
+        # 五派辩论（蔡森/缠论/CAN SLIM/K线战法 四派讨论 → 海平终判）
+        if fields.get("llm_debate_enabled") is not None:
+            acc["llm_debate_enabled"] = bool(fields["llm_debate_enabled"])
+        # 分组模型: 海平决策/终判、四派顾问(可逐派)、收盘复盘 各用哪个模型
+        # （空 = 跟随全局 AI 设置：复盘先跟随「分析」组，再跟随全局 ai_model）
+        for key in ("llm_model", "llm_debate_model", "llm_review_model",
+                    *_DEBATE_ANALYST_MODEL_KEYS):
+            v = fields.get(key)
+            if v is None:
+                continue
+            text = str(v).strip()
+            if len(text) > 200:
+                raise ValueError(f"{key} 过长（模型名应 ≤200 字符）")
+            acc[key] = text
+        if fields.get("llm_debate_rounds") is not None:
+            n = int(fields["llm_debate_rounds"])
+            if not (1 <= n <= 3):
+                raise ValueError("llm_debate_rounds 必须在 1~3 之间")
+            acc["llm_debate_rounds"] = n
+        if fields.get("llm_debate_daily_max") is not None:
+            n = int(fields["llm_debate_daily_max"])
+            if not (0 <= n <= 100):
+                raise ValueError("llm_debate_daily_max 必须在 0~100 之间")
+            acc["llm_debate_daily_max"] = n
         save_account(data_dir, acc, account_id)
         return acc
 

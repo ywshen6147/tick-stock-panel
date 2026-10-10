@@ -1184,6 +1184,10 @@ def _register_review_job(scheduler, repo, hour: int, minute: int) -> None:
 MINUTE_BACKFILL_HOUR = 15
 MINUTE_BACKFILL_MINUTE = 10
 
+# 模拟盘智能体每日收盘复盘默认时间（盘后管道默认 15:35 之后，数据已定版）
+PAPER_REVIEW_HOUR = 15
+PAPER_REVIEW_MINUTE = 35
+
 
 def _minute_backfill_symbols(data_dir: Path) -> list[str]:
     """需要补齐分钟K的标的：自选 ∪ 各模拟账户持仓 ∪ 各账户 LLM 跟单标的池。
@@ -1395,13 +1399,56 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         replace_existing=True,
     )
 
+    # 模拟盘智能体「每日收盘复盘」: 复盘自己的当日交易 → 沉淀记忆/知识库 → 反哺次日决策。
+    # 与大盘复盘 (review_schedule) 彼此独立: 那个产出市场报告, 这个产出交易员纪律。
+    # 只对**当日有成交/委托**的活跃账户跑, 不烧 token; 开关与时间走 paper_review_schedule。
+    def _paper_daily_review():
+        from app.services import preferences
+
+        cfg = preferences.get_paper_review_schedule()
+        if not cfg.get("enabled"):
+            return
+        app_state = _get_app_state()
+        repo_live = getattr(app_state, "repo", None) or repo
+        data_dir = getattr(getattr(repo_live, "store", None), "data_dir", None)
+        if data_dir is None:
+            logger.warning("模拟盘复盘: 拿不到 data_dir, 跳过")
+            return
+        try:
+            from app.strategy import paper_memory
+
+            res = paper_memory.review_all_accounts(Path(data_dir))
+            done = [a for a in (res.get("accounts") or []) if a.get("ok") and not a.get("skipped")]
+            skipped = [a for a in (res.get("accounts") or []) if a.get("skipped")]
+            failed = [a for a in (res.get("accounts") or []) if not a.get("ok")]
+            logger.info(
+                "模拟盘每日复盘: 完成 %d 个账户, 跳过 %d, 失败 %d (%s)",
+                len(done), len(skipped), len(failed),
+                ", ".join(f"{a.get('account')}:{a.get('skipped') or a.get('error')}"
+                          for a in (skipped + failed)) or "-",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("模拟盘每日复盘失败: %s", e)
+
+    _paper_cfg = _prefs.get_paper_review_schedule()
+    scheduler.add_job(
+        _paper_daily_review,
+        trigger=CronTrigger(day_of_week="mon-fri",
+                            hour=_paper_cfg["hour"], minute=_paper_cfg["minute"],
+                            timezone="Asia/Shanghai"),
+        id="paper_daily_review",
+        misfire_grace_time=7200,  # 复盘非关键, 允许 2 小时内补跑
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info(
         "scheduler started; instruments@%02d:%02d, pipeline@%02d:%02d, depth@%02d:%02d, "
-        "minute_backfill@%02d:%02d mon-fri",
+        "minute_backfill@%02d:%02d, paper_review@%02d:%02d mon-fri",
         inst_sched["hour"], inst_sched["minute"], sched["hour"], sched["minute"],
         depth_sched["hour"], depth_sched["minute"],
         MINUTE_BACKFILL_HOUR, MINUTE_BACKFILL_MINUTE,
+        _paper_cfg["hour"], _paper_cfg["minute"],
     )
     return scheduler
 

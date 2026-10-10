@@ -35,6 +35,9 @@ interface Props {
  *
  * - 内置信号 (signal_*): 全部展示
  * - 自定义信号 (csg_*): 按 kind 过滤 (entry / exit / both), 除非 filterCustomByKind=false
+ * - **盘中信号 (timeframe=intraday) 一律不列出**: 它们的列名是 csgi_*、只存在于分钟
+ *   特征帧; 选股/回测/监控都在**日线帧**上求值, 选中只会得到一个不存在的列
+ *   (策略运行报错或条件恒 false)。信号库页面仍会展示它们(带「盘中」徽标)。
  * - entry 蓝色主题, exit 橙色主题; 自定义信号边框配色与内置一致, 右上角 PenLine 角标区分
  */
 export function SignalPicker({ signals, onChange, kind, options }: Props) {
@@ -43,7 +46,9 @@ export function SignalPicker({ signals, onChange, kind, options }: Props) {
 
   const customOptions = useMemo(() => {
     const list = (customSignalsQuery.data?.signals ?? [])
-      .filter(s => s.enabled && (!filterCustomByKind || s.kind === kind || s.kind === 'both'))
+      .filter(s => s.enabled)
+      .filter(s => s.timeframe !== 'intraday')   // 盘中信号 → csgi_*, 日线帧不可用
+      .filter(s => !filterCustomByKind || s.kind === kind || s.kind === 'both')
     const names: Record<string, string> = {}
     for (const cs of list) names[`csg_${cs.id}`] = cs.name
     return { list, names }

@@ -54,6 +54,18 @@ _ACTIVITY_WINDOW_MIN = 30
 # 自定义展示板块上限 / 活跃默认行数
 _MAX_SERIES_ROWS = 20
 _DEFAULT_SERIES_ROWS = 10
+# 分钟数据源（优先级顺序）:
+#   1) kline_minute     真实分钟K（权威 OHLC/量额；盘后 minute_backfill 补全天）
+#   2) kline_minute_rt  合成分钟K（stocksdk 全市场快照，只有 close、量额为 0；
+#                       服务冷启动当天从启动时刻才开始写）
+# 只读合成目录会让走势图从「服务启动时刻」起（实测 2026-09-30 从 13:35 开始，
+# 因为当天 13:35 才启动）→ 必须合并：真实K 补 9:30 起的缺口，合成K 补实时尾部，
+# 同 (symbol, datetime) 以真实K 为准（顺带恢复活跃度所需的成交额）。
+_MINUTE_SOURCES = ("kline_minute", "kline_minute_rt")
+# 桶覆盖度闸门阈值: 桶内标的数 < 当日桶覆盖 P90 × 该比例 → 丢弃该桶
+# (防止只有 2~3 只股票的历史分区把板块曲线算成噪声)
+_BUCKET_COVERAGE_QUANTILE = 0.9
+_MIN_BUCKET_COVERAGE_RATIO = 0.2
 # 自动活跃榜默认排除的属性类板块 (名称子串匹配): 交易属性/指数成分/持仓/事件类
 # "标签桶"成员数动辄数百上千, 成交额合计天然占优, 会挤出真实题材。用户可通过
 # exclude_sectors 参数整体替换该名单; 传空数组 = 关闭名称过滤 (成员数上限仍生效)。
@@ -128,22 +140,42 @@ def _prev_daily_close(data_dir: Path, target_date: str) -> pl.DataFrame | None:
     )
 
 
-def _minute_pcts(minute_dir: Path, target: str) -> tuple[pl.DataFrame | None, str, bool]:
-    """当日全市场分钟 → (_bare, _bucket, _pct[, amount]); 读取失败返回 (None, reason, False)。
+def _minute_pcts(minute_dirs: list[Path], target: str) -> tuple[pl.DataFrame | None, str, bool]:
+    """当日全市场分钟（多源合并）→ (_bare, _bucket, _pct[, amount])。
+
+    合并语义: 按 ``minute_dirs`` 顺序读取同一日期分区并纵向拼接, 同
+    ``(symbol, datetime)`` **保留先出现者**（调用方把真实分钟K放前面）。
+    这样真实K覆盖 9:30 起的完整时段、合成K补实时尾部, 走势图不再从冷启动
+    时刻开始（实测 2026-09-30 仅合成时有 13:35~15:00）。
 
     amount 列缺失 (旧 schema) 时走精简读取, has_amount=False 由上层降级活跃度。
+    读取失败/都不存在返回 (None, reason, False)。
     """
-    path = minute_dir / f"date={target}" / "part.parquet"
-    try:
-        bars = pl.read_parquet(path, columns=["symbol", "datetime", "close", "amount"])
-        has_amount = True
-    except Exception:
+    frames: list[pl.DataFrame] = []
+    has_amount = False
+    for minute_dir in minute_dirs:
+        path = minute_dir / f"date={target}" / "part.parquet"
+        if not path.exists():
+            continue
         try:
-            bars = pl.read_parquet(path, columns=["symbol", "datetime", "close"])
-            has_amount = False
-        except Exception as exc:
-            logger.warning("sector_rotation read minute partition failed: %s", exc)
-            return None, "minute_schema", False
+            bars = pl.read_parquet(path, columns=["symbol", "datetime", "close", "amount"])
+            has_amount = True
+        except Exception:
+            try:
+                bars = pl.read_parquet(path, columns=["symbol", "datetime", "close"])
+                # 补齐 amount 以便纵向拼接（合成K本就把 amount 记 0）
+                bars = bars.with_columns(pl.lit(0.0).alias("amount"))
+            except Exception as exc:
+                logger.warning("sector_rotation read minute partition failed (%s): %s", minute_dir.name, exc)
+                continue
+        if not bars.is_empty():
+            frames.append(bars)
+    if not frames:
+        return None, "minute_schema", has_amount
+    bars = pl.concat(frames, how="vertical_relaxed") if len(frames) > 1 else frames[0]
+    if len(frames) > 1:
+        # 真实K优先: 同分钟保留先出现的源
+        bars = bars.unique(subset=["symbol", "datetime"], keep="first", maintain_order=True)
     # close <= 0 / 非有限的分钟行无效: 作基准时 pct 为 inf, 作分子时是 -100% 假跌幅
     bars = bars.drop_nulls(subset=["datetime", "close"]).filter(
         pl.col("close").cast(pl.Float64).is_finite() & (pl.col("close") > 0)
@@ -152,7 +184,7 @@ def _minute_pcts(minute_dir: Path, target: str) -> tuple[pl.DataFrame | None, st
         return None, "minute_empty", has_amount
     bars = bars.with_columns(_bare().alias("_bare"))
 
-    prev = _prev_daily_close(minute_dir.parent, target)
+    prev = _prev_daily_close(minute_dirs[0].parent, target)
     joined = bars.join(prev, on="_bare", how="left") if prev is not None else bars.with_columns(
         pl.lit(None, dtype=pl.Float64).alias("prev_close")
     )
@@ -170,6 +202,35 @@ def _minute_pcts(minute_dir: Path, target: str) -> tuple[pl.DataFrame | None, st
     if out.is_empty():
         return None, "minute_empty", has_amount
     return out, basis, has_amount
+
+
+def _drop_thin_buckets(pcts: pl.DataFrame, bucket_minutes: int) -> tuple[pl.DataFrame, int]:
+    """丢弃成分股覆盖度明显不足的分钟桶, 返回 (过滤后帧, 丢弃桶数)。
+
+    为什么需要: 本机真实分钟主分区 `kline_minute` 只落过用户看过的少数标的
+    (实测 2026-09-30 全天仅 3 只), 而合成 `kline_minute_rt` 有全市场(5565 只)。
+    合并后 09:30~13:30 的桶只有 2~3 个样本 → 板块等权 pct 会由极少数股票算出,
+    曲线"看似从 9:30 开始"实则无意义。
+
+    基准取**当日桶覆盖的 P90**(而不是中位数): 缺样本的时段可能占多数桶
+    (2026-09-30 就是 31 个桶只有 3 只 vs 18 个桶 5565 只, 中位数会退化成 3 而
+    失去判别力)。P90 ≈ 全市场峰值覆盖, 正常交易日各桶接近峰值 → 不会误杀。
+    """
+    if pcts.is_empty():
+        return pcts, 0
+    keyed = pcts.with_columns(
+        pl.col("datetime").dt.truncate(f"{bucket_minutes}m").alias("_b")
+    )
+    cov = keyed.group_by("_b").agg(pl.col("_bare").n_unique().alias("_n"))
+    full = cov["_n"].quantile(_BUCKET_COVERAGE_QUANTILE, interpolation="nearest")
+    if not full:
+        return pcts, 0
+    keep = cov.filter(pl.col("_n") >= max(1.0, float(full) * _MIN_BUCKET_COVERAGE_RATIO))
+    dropped = cov.height - keep.height
+    if dropped <= 0:
+        return pcts, 0
+    out = keyed.join(keep.select("_b"), on="_b", how="semi").drop("_b")
+    return out, dropped
 
 
 def _load_sector_flow(data_dir: Path, flow_field: str) -> pl.DataFrame | None:
@@ -404,8 +465,15 @@ def build_sector_rotation(
 
 
 def _compute(repo, data_dir: Path, kind: str, flow_field: str | None, top: int, bucket_minutes: int, series_names: list[str] | None, exclude_sectors: tuple[str, ...], auto_rows: int, sort_by: str) -> dict:
-    minute_dir = data_dir / "kline_minute"
-    target = _latest_minute_partition(minute_dir)
+    # 分钟源合并 (真实主分区 + 合成目录, 见 _MINUTE_SOURCES):
+    # 合成目录由 MinuteRefreshService 用实时快照写入, 冷启动当天只有启动时刻起
+    # 的数据 → 单独读会让走势图从启动时刻开始(实测 13:35)。真实主分区含 9:30 起
+    # 全时段(盘后 minute_backfill 补齐), 两者合并后同分钟以真实K为准。
+    minute_dirs = [data_dir / name for name in _MINUTE_SOURCES]
+    target = max(
+        (d for d in (_latest_minute_partition(md) for md in minute_dirs) if d),
+        default=None,
+    )
     if not target:
         return {"status": "no_data", "reason": "minute_missing", "kind": kind}
 
@@ -413,9 +481,22 @@ def _compute(repo, data_dir: Path, kind: str, flow_field: str | None, top: int, 
     if map_df.is_empty() or member_count == 0:
         return {"status": "no_data", "reason": "members_missing", "date": target, "kind": kind}
 
-    pcts, basis, has_amount = _minute_pcts(minute_dir, target)
+    pcts, basis, has_amount = _minute_pcts(minute_dirs, target)
     if pcts is None:
         return {"status": "no_data", "reason": basis, "date": target, "kind": kind}
+
+    # 覆盖度闸门: 本机真实分钟主分区只存过用户看过的少数标的(实测 2026-09-30
+    # 全天仅 3 只, 下午合成K 5565 只)。若直接合并, 上午桶只有 2~3 个样本,
+    # 板块 pct 会由极少数股票算出 → 曲线看似"从 9:30 开始"实则无意义。
+    # 这里按桶丢弃覆盖度过低的桶(低于当日桶覆盖中位数的 20%), 只显示可信区间。
+    pcts, dropped_buckets = _drop_thin_buckets(pcts, bucket_minutes)
+    if dropped_buckets:
+        logger.info(
+            "sector_rotation[%s] 丢弃 %d 个覆盖不足的分钟桶 (行情源缺该时段全市场分钟)",
+            kind, dropped_buckets,
+        )
+    if pcts.is_empty():
+        return {"status": "no_data", "reason": "minute_thin_coverage", "date": target, "kind": kind}
 
     # 桶化 + 板块聚合: 先每股桶内均值 (成交额按桶合计), 再板块等权均值 (停牌/缺分钟不放大权重)
     member_df = map_df.rename({"_sym_up": "_bare", kind: "_member"})

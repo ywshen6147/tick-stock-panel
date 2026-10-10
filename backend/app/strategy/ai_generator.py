@@ -160,7 +160,7 @@ class AIStrategyGenerator:
 
     async def stream(self, user_prompt: str):
         """Yield generated strategy code deltas from the configured AI provider."""
-        from app.services.ai_provider import stream_ai_text
+        from app.services.ai_provider import stream_ai_text, role_model
 
         guide = self._get_guide()
         async for chunk in stream_ai_text(
@@ -171,6 +171,8 @@ class AIStrategyGenerator:
             temperature=0.3,
             # None = 不传上限: 策略代码较长, 推理模型思考 token 计入预算会截断代码
             max_tokens=None,
+            # 分组模型：「策略」组，可在 设置→AI 配置
+            model=role_model("strategy"),
         ):
             yield chunk
 
@@ -306,7 +308,7 @@ META = {{...}}，{entrypoint_requirement}。只输出完整 Python 代码。
 
     async def _call_llm(self, user_prompt: str, guide: str) -> str:
         """Call the configured AI provider and return generated strategy code."""
-        from app.services.ai_provider import generate_ai_text
+        from app.services.ai_provider import generate_ai_text, role_model
 
         content = await generate_ai_text(
             [
@@ -316,6 +318,8 @@ META = {{...}}，{entrypoint_requirement}。只输出完整 Python 代码。
             temperature=0.3,
             # None = 不传上限: 策略代码较长, 推理模型思考 token 计入预算会截断代码
             max_tokens=None,
+            # 分组模型：「策略」组，可在 设置→AI 配置
+            model=role_model("strategy"),
         )
         return self._extract_code_block(content)
 

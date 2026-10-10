@@ -22,13 +22,14 @@ import httpx
 
 from app.data_providers.base import AssetType
 from app.data_providers.normalizer import normalize_adj_factors, normalize_daily
+from app.market_time import cn_now
 from app.plugins.stocksdk import bridge
 from app.tickflow.rate_limits import chunked
 
 logger = logging.getLogger(__name__)
 
 # stock-sdk 支持的数据集(financial 不支持 → 不声明, 自动回退 tickflow)
-_DATASETS = ("daily", "adj_factor", "minute", "realtime")
+_DATASETS = ("daily", "adj_factor", "minute", "realtime", "full_minute")
 
 # 每次桥接调用的符号数。桥接内部按 concurrency 并发, 分批仅为进度反馈与超时控制。
 _BATCH = 40
@@ -238,6 +239,69 @@ class StockSDKProvider:
         # 末窗口(最新一日)的真实 open 与首窗口可能重叠同日(时区/边界), keep="last"
         # 由上层 _write_minute_partition 的 unique 处理; 这里仅拼接。
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+    # ---- full_minute (全量分钟, 盘中轮动/板块切换等消费方) ----
+    # 由 MinuteRefreshService 分两种轮次消费, 各自的数据源不同:
+    #
+    # 1) 稳态增量轮 → get_intraday_latest(): stock-sdk 没有 TickFlow
+    #    intraday.universe 那样的"全市场每只最新 N 根"单请求端点; 逐标的
+    #    cnMinute 全市场扫一轮要 10+ 分钟, 撑不起盘中刷新节奏。故用全市场实时
+    #    快照 (单次分页, ~10-15s) 合成"当前分钟K": datetime = 当前北京分钟,
+    #    OHLC = 最新价, volume/amount = 0。落盘走 _write_minute_partition 的
+    #    unique(symbol,datetime) 幂等合并 (同分钟 keep="last"), 跨分钟累积出全天。
+    #
+    # 2) 全天修复轮 → get_intraday_batch(): **有界**, 只种"当前分钟", 不拉全天历史。
+    #    取舍: 逐标的 cnMinute 拉全市场一天实测 ≈15 分钟 (4 并发); 修复轮持轮次锁,
+    #    拉全天会把盘中增量轮一起卡住 → 实时分时反而停摆。故与增量轮同口径。
+    #    因此**服务只要从开盘前运行**, 就逐分钟累积出全天分时 (自启动时刻起)。
+    #    要补齐历史某日全天分钟 → 走离线并发回补
+    #    (backend/scripts/backfill_minute_day.py): 不占轮次锁、不影响盘中实时。
+    #    曾踩的坑: 早期实现被误当"真修复", 实际补不了历史, 导致板块轮动/分时图
+    #    只能从进程启动时刻开始 (实测 2026-09-30 从 13:35 起)。
+    #
+    # 局限: 合成K无真实 OHLC/量额 → 活跃度维度退化 (卡片有 has_amount 降级路径),
+    # 离线回补并入真实K后量额恢复。
+    def get_intraday_latest(self, count: int = 3) -> pl.DataFrame:
+        """全市场实时快照 → 当前分钟合成K (每只标的一根, 增量轮)。"""
+        del count  # 快照只取当前盘口, 无"最近 N 根"概念
+        rows = self.get_realtime()
+        if not rows:
+            return pl.DataFrame()
+        # 保留时区 (Asia/Shanghai): _enforce_minute_beijing_wallclock 对 tz-aware
+        # 输入走「转北京墙钟」分支, 不依赖交易时段启发式 — 午休/收盘后自测也能过
+        now = cn_now().replace(second=0, microsecond=0)
+        bars: list[dict] = []
+        for row in rows:
+            symbol = row.get("symbol")
+            price = row.get("last_price")
+            if not symbol or price is None:
+                continue
+            price = float(price)
+            bars.append({
+                "symbol": symbol,
+                "datetime": now,
+                "open": price, "high": price, "low": price, "close": price,
+                "volume": 0.0, "amount": 0.0,
+            })
+        if not bars:
+            return pl.DataFrame()
+        return pl.DataFrame(bars, schema={
+            "symbol": pl.Utf8, "datetime": pl.Datetime("us", "Asia/Shanghai"),
+            "open": pl.Float64, "high": pl.Float64, "low": pl.Float64, "close": pl.Float64,
+            "volume": pl.Float64, "amount": pl.Float64,
+        })
+
+    def get_intraday_batch(self, symbols: list[str] | None = None, count: int = 300) -> pl.DataFrame:
+        """有界修复轮: 全市场实时快照 → 当前分钟合成K, 可按 symbols 过滤。
+
+        **不拉全天历史**: 全市场逐标的 cnMinute 一天 ≈15 分钟, 会卡住增量轮
+        (见上方取舍说明)。历史某日的全天补齐走离线并发回补脚本。
+        """
+        df = self.get_intraday_latest(count=count)
+        if symbols and not df.is_empty():
+            wanted = set(symbols)
+            df = df.filter(pl.col("symbol").is_in(wanted))
+        return df
 
     @staticmethod
     def _null_degenerate_opens(df: pl.DataFrame) -> pl.DataFrame:

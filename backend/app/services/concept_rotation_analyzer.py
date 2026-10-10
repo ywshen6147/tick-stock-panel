@@ -366,7 +366,7 @@ async def analyze_rotation_stream(
 
     # 5. 构建 prompt + 流式调用 LLM
     try:
-        from app.services.ai_provider import stream_ai_text, ai_configured
+        from app.services.ai_provider import stream_ai_text, ai_configured, role_model
 
         if not ai_configured():
             yield json.dumps({
@@ -386,6 +386,8 @@ async def analyze_rotation_stream(
             # 不限制输出(推理模型思考 token 计入预算, 见 ai_provider.stream_ai_text)
             max_tokens=None,
             prefer_final_answer=True,
+            # 分组模型：「分析」组，可在 设置→AI 配置
+            model=role_model("analysis"),
         ):
             got_content = True
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)

@@ -816,11 +816,17 @@ def get_minute_batch(request: Request, body: dict):
         else:
             stale_last[sym] = sub["datetime"][-1]
 
-    # prefer_local 生效判定: 仅当全量分钟服务健康 (freshness 契约, 见 minute_refresh.is_healthy)
+    # prefer_local 生效判定: 仅当全量分钟服务健康且维护 kline_minute 主分区
+    # (freshness 契约, 见 minute_refresh.is_healthy / writes_main_partition)。
+    # 合成源 (stocksdk 实时快照) 写独立目录 kline_minute_rt, 不维护真实主分区
+    # → 个股分时恒走补拉真实数据, 不被合成K (无真实 OHLC/量额) 污染。
     full_minute_healthy = False
     if prefer_local:
         svc = getattr(request.app.state, "minute_refresh", None)
-        full_minute_healthy = bool(svc is not None and svc.is_healthy())
+        full_minute_healthy = bool(
+            svc is not None and svc.is_healthy()
+            and getattr(svc, "writes_main_partition", lambda: False)()
+        )
     if full_minute_healthy:
         # 纯尾部落后 (stale_last): 服务的增量轮下一轮就会补上, 股票不补拉省请求。
         # 空洞 (full_pull: 空分区 / 中间洞 / 前部洞): 服务增量锚定本地最新时间,

@@ -178,6 +178,11 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
   const [flow, setFlow] = useState<string>(() => localStorage.getItem(`${FLOW_LS_PREFIX}${kind}`) ?? '')
   const [bucket, setBucket] = useState(5)
   const [hoverName, setHoverName] = useState<string | null>(null)
+  // 走势图默认**只画 1 条线** (点榜单行可切换聚焦板块; 需要横向对比时再开「显示全部」)。
+  // 之前默认把展示板块(默认 10 个、最多 20 个)全部画上, 20 条线互相压盖、图例挤占底部,
+  // 更像"一堆线"而不是分时图。
+  const [focusSector, setFocusSector] = useState<string | null>(null)
+  const [trendAll, setTrendAll] = useState(false)
   // 展示板块来源: 自动榜 (5 种排序维度, 剔除属性板块) 或自定义监控 (≤20)
   const [rowsMode, setRowsMode] = useState<SectorSource>(() =>
     parseSectorSource(localStorage.getItem(`${ROWS_MODE_PREFIX}${kind}`)))
@@ -258,6 +263,10 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
   const maxHeatRows = rowsMode === 'custom' ? MAX_CUSTOM_SECTORS : Math.max(HEAT_ROWS, autoRows)
   const heatRows = Math.min(maxHeatRows, displayNames.length)
   const heatNames = displayNames.slice(0, heatRows)
+  /** 走势图单线聚焦的板块 (null = 显示全部) — 图/标题/榜单高亮共用同一来源 */
+  const trendFocus = trendAll
+    ? null
+    : (focusSector && displayNames.includes(focusSector) ? focusSector : (displayNames[0] ?? null))
 
   // 盘中/回放: 轮动日期 == 北京今天且处于连续竞价时段 → 盘中 (仅在连续竞价时
   // 最后一桶才是"未封口"的; 午休/盘前/收盘后一律按回放呈现)
@@ -332,6 +341,8 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
   const trendOption = useMemo<echarts.EChartsOption | null>(() => {
     const heatSeries = data?.series
     if (!heatSeries || !heatSeries.sectors.length || !heatSeries.buckets.length) return null
+    // 单线聚焦: 默认只画 1 条 (trendFocus ?? 榜单首位=当前最强); 「显示全部」画全部展示板块
+    const trendNames: string[] = trendAll ? displayNames : (trendFocus ? [trendFocus] : [])
     const buckets = heatSeries.buckets.slice(startCol)
     return {
       grid: { left: 44, right: 46, top: 12, bottom: 30 },
@@ -377,7 +388,11 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
         axisLabel: { fontSize: 9, color: chartTheme.text, formatter: (v: number) => `${(v * 100).toFixed(1)}%` },
         splitLine: { lineStyle: { color: 'rgba(128,140,160,0.15)' } },
       },
-      series: heatSeries.sectors.map((name, i) => ({
+      series: heatSeries.sectors
+        // 单线聚焦: 默认只画 1 条 (focusSector ?? 榜单首位=当前最强), 「显示全部」才全画
+        .map((name, i) => ({ name, i }))
+        .filter(({ name }) => trendNames.includes(name))
+        .map(({ name, i }) => ({
         name,
         type: 'line' as const,
         smooth: true,
@@ -405,9 +420,9 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
             data: [{ yAxis: 0 }], label: { show: false },
           },
         } : {}),
-      })),
+        })),
     }
-  }, [data, bucket, startCol, timeline, chartTheme, phase, dimLabel, cols])
+  }, [data, bucket, startCol, timeline, chartTheme, phase, dimLabel, cols, trendAll, trendFocus, displayNames])
   const trend = useEChart(trendOption, {
     onMouseOver: (params) => {
       if (params.seriesType === 'line' && params.seriesName) setHoverName(params.seriesName)
@@ -924,10 +939,28 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
           ) : (
             displayNames.length > 0 && (
               <div key="trend" className="rounded-lg border border-border/60 bg-elevated/30 p-1.5">
-                <div className="px-1 pb-1 text-[9px] text-muted">
-                  展示板块涨幅走势 (桶内均值, 右轴 %) — 线上穿 0% 轴为切入, 下穿为退潮; 悬停列表或线条即聚焦: 其余线压暗、目标线加粗并浮出名称, 图例可单看某条线
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 px-1 pb-1 text-[9px] text-muted">
+                  <span>
+                    板块涨幅走势 (桶内均值, 右轴 %)
+                    {trendAll
+                      ? ` · 全部 ${displayNames.length} 条`
+                      : ` · 仅 ${trendFocus ?? '—'}`}
+                     — 线上穿 0% 轴为切入, 下穿为退潮; 点右侧榜单行可切换只看该板块
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setTrendAll(v => !v)}
+                    className="ml-auto shrink-0 cursor-pointer rounded border border-border px-1.5 py-0.5 text-[9px] text-muted transition-colors hover:border-accent/40 hover:text-accent"
+                    title={trendAll ? '只看 1 条线（默认）' : '显示全部展示板块的线'}
+                  >
+                    {trendAll ? '只看一条' : '显示全部'}
+                  </button>
                 </div>
-                <div ref={trend.ref} style={{ height: Math.max(260, displayNames.length * 8 + 240) }} className="w-full" />
+                <div
+                  ref={trend.ref}
+                  style={{ height: Math.max(260, (trendAll ? displayNames.length : 1) * 8 + 240) }}
+                  className="w-full"
+                />
               </div>
             )
           )}
@@ -1003,9 +1036,12 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
                     key={sector.name}
                     onMouseEnter={() => setHoverName(sector.name)}
                     onMouseLeave={() => setHoverName(null)}
+                    onClick={() => { setFocusSector(sector.name); setTrendAll(false) }}
+                    title={`点击只看「${sector.name}」走势 (再点「显示全部」恢复对比)`}
                     className={cn(
-                      'grid grid-cols-[minmax(0,1.4fr)_64px_64px_58px_minmax(72px,1fr)] items-center border-b border-border/40 px-2 py-1.5 text-[10px] last:border-b-0 hover:bg-elevated/40',
+                      'grid cursor-pointer grid-cols-[minmax(0,1.4fr)_64px_64px_58px_minmax(72px,1fr)] items-center border-b border-border/40 px-2 py-1.5 text-[10px] last:border-b-0 hover:bg-elevated/40',
                       hoverName === sector.name && 'bg-accent/10',
+                      !trendAll && trendFocus === sector.name && 'bg-accent/15',
                     )}
                   >
                     <span className="truncate font-medium text-foreground" title={`${sector.name} · 成分 ${sector.n_members_with_bars}/${sector.n_members}`}>

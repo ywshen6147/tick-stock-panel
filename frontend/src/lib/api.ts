@@ -45,6 +45,9 @@ const COMPUTE_REQUEST_TIMEOUT_MS = 300_000
  *  浏览器端 fetch 默认 30s abort 会先于后端超时触发, 大响应接口 (如全量集合竞价
  *  /day, 后端超时 120s) 必须把这层同步放宽。 */
 const extPullTimeoutMs = (timeoutSeconds?: number) => (timeoutSeconds ?? 30) * 1000 + 10_000
+/** 五派辩论（POST /api/paper/debate）: 4 派 × 3 轮 = 12 次串行模型调用,
+ *  实测 2~3 分钟。默认 30s 会在结果回来之前 abort, 必须单独放宽到 10 分钟。 */
+const DEBATE_REQUEST_TIMEOUT_MS = 600_000
 
 async function request<T>(path: string, init?: RequestOptions): Promise<T> {
   const { quiet, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, ...fetchInit } = init ?? {}
@@ -1008,8 +1011,13 @@ export interface AiIterateResult {
 // ===== Custom Signals (自定义信号) =====
 export interface CustomSignalCondition {
   left: string     // 字段名
-  op: string       // > >= < <= == !=
-  right: string    // "field:xxx" 或数字字符串
+  op: string       // > >= < <= == != ; 盘中额外: cross_up cross_down
+  /**
+   * 右值: `"field:xxx"` 字段引用 **或数字常量**。
+   * 注意历史定义 / 盘中信号里 right 直接是数字（0.03、2、-0.03 等），
+   * 渲染与编辑必须用 `lib/signals.ts` 的 isFieldRef/rightConstantText，不要直接 startsWith。
+   */
+  right: string | number
   leftDays?: number   // 左字段取几日前 (0=当日, 默认)
   rightDays?: number  // 右字段取几日前 (仅 right 为字段时有意义)
 }
@@ -1020,6 +1028,13 @@ export interface CustomSignal {
   kind: 'entry' | 'exit' | 'both'
   conditions: CustomSignalCondition[]
   enabled: boolean
+  /**
+   * 信号周期: daily(缺省) = 日线 enriched 帧, 列名 csg_*；
+   * intraday = 分钟特征帧, 列名 csgi_*，**不能用于选股/回测/监控**（那些走日线帧）。
+   */
+  timeframe?: 'daily' | 'intraday'
+  /** 仅 intraday: 当日最少已完成 bar 数, 不足不触发 */
+  min_bars?: number
 }
 
 export interface CustomSignalFieldGroup {
@@ -1237,6 +1252,12 @@ export interface PaperLlmStatus {
     exit_all: number
   }
   symbols: string[]
+  /** 海平决策/终判使用的模型（空 = 跟随全局 AI 设置模型 ai_model_default） */
+  model?: string
+  /** 收盘复盘使用的模型（空 = 跟随「分析」组，再跟随全局） */
+  review_model?: string
+  /** 全局 AI 设置里的模型（分组模型的默认值） */
+  ai_model_default?: string
   /** 最近一次决策的状态（含最近分时快照 last_market：价格/均价线/数据源） */
   state: {
     last_run_at?: string
@@ -1255,6 +1276,75 @@ export interface PaperLlmStatus {
     last_market?: Record<string, { price?: number | null; vwap?: number | null; source?: string }>
     runs?: number
   }
+  /** 五派辩论状态（可选: 旧后端无此字段时前端按"未启用"降级显示） */
+  debate?: PaperDebateStatus
+}
+
+// ── 五派辩论（蔡森/缠论/CAN SLIM/K线 四派顾问 × 3 轮 → 海平终判 + 代码风控闸门） ──
+/** 单个顾问（来自 llm_status.debate.analysts） */
+export interface PaperDebateAnalyst {
+  id: 'caishen' | 'chanlun' | 'canslim' | 'kxian' | string
+  name: string
+  school?: string
+  /** 该派关注的角度（如"转折与波段"） */
+  view?: string
+}
+
+/** 当日辩论用量与上次结论（GET /api/paper/llm_status 的 debate 字段） */
+export interface PaperDebateStatus {
+  enabled: boolean
+  /** 辩论轮数（1~3，每派每轮一次模型调用） */
+  rounds: number
+  /** 当日最多召集几次（安全网） */
+  daily_max: number
+  /** 四派顾问使用的模型（空 = 跟随全局 AI 设置） */
+  model?: string
+  /** 四派**逐派**生效模型 {analyst_id: model}（空串 = 跟随全局） */
+  models?: Record<string, string>
+  /** 四派逐派**显式设置**的原值（空串 = 未单独设置）—— 供面板头部编辑器回填 */
+  models_set?: Record<string, string>
+  /** 风控闸门阈值: 反对开新仓的派数达到该值即禁止开仓 */
+  gate_threshold: number
+  analysts: PaperDebateAnalyst[]
+  day?: string
+  runs_today: number
+  last_at?: string | null
+  last_summary?: string | null
+  last_oppose?: number | null
+}
+
+/** 手动召集（POST /api/paper/debate）返回的单派结论 */
+export interface PaperDebateStatement {
+  name: string
+  school?: string
+  stance?: '多' | '空' | '中性' | null
+  action_bias?: 'buy' | 'sell' | 'reduce' | 'stop' | 'hold' | null
+  oppose_new_position?: boolean
+  points?: string[]
+  /** 该派失败/未给出有效 JSON 时的原因 */
+  error?: string | null
+}
+
+/** 代码层风控闸门: ≥threshold 派明确反对开新仓 → 禁止开仓（只允许减仓/止损） */
+export interface PaperDebateGate {
+  allow_open: boolean
+  oppose_count: number
+  threshold: number
+  reason?: string
+}
+
+export interface PaperDebateResult {
+  ok: boolean
+  rounds: number
+  /** 未给出有效结论的派数 */
+  degraded: number
+  consensus?: string
+  stance_count?: Record<string, number>
+  oppose_new_position?: number
+  gate?: PaperDebateGate
+  /** 纯文本 markdown 纪要 */
+  summary?: string
+  statements?: PaperDebateStatement[]
 }
 
 /** LLM 触发统计的"单日"记录 (GET /api/paper/llm_stats) */
@@ -1296,6 +1386,143 @@ export interface PaperAccountSummary {
   cash?: number
   latest_nav?: number | null
   created_at?: string
+}
+
+// ── 智能体记忆 / 知识库 / 每日收盘复盘 (GET /api/paper/memory) ──
+export interface PaperMemoryLesson {
+  id: string
+  date: string
+  last_seen?: string
+  kind?: string
+  text: string
+  tags: string[]
+  confidence: number
+  hits: number
+  status?: string
+}
+
+export interface PaperMemoryKnowledge {
+  id: string
+  title: string
+  body: string
+  tags: string[]
+  source?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface PaperMemoryReviewBody {
+  summary: string
+  what_worked: string[]
+  what_failed: string[]
+  mistakes: string[]
+  lessons: { text: string; tags: string[]; confidence: number }[]
+  knowledge_updates: { title: string; body: string; tags: string[] }[]
+  next_focus: string[]
+  rule_adjustments: { rule: string; change: string; reason: string }[]
+}
+
+export interface PaperMemoryReview {
+  date: string
+  account: string
+  created_at: string
+  metrics: {
+    nav?: number | null
+    day_pnl?: number | null
+    realized_pnl?: number | null
+    fills?: number
+    orders?: number
+    round_trips?: number
+    decisions?: number
+    ordered?: number
+    hold?: number
+    rejected?: number
+    patterns?: Record<string, number>
+  }
+  patterns?: Record<string, number>
+  review: PaperMemoryReviewBody
+}
+
+export interface PaperMemoryProfile {
+  account: string
+  updated_at: string
+  days_reviewed: number
+  last_review_day: string | null
+  rounds?: number
+  win_rate?: number
+  profit_loss_ratio?: number | null
+  avg_holding_days?: number
+  realized_pnl?: number
+  max_drawdown?: number | null
+  nav_latest?: number | null
+  focus: string[]
+  disciplines: string[]
+  pattern_totals: Record<string, number>
+  streak: { days: number; pnl: number }
+  top_lessons: { text: string; confidence: number; tags: string[] }[]
+}
+
+export interface PaperMemoryPayload {
+  status: {
+    available: boolean
+    account?: string
+    profile?: PaperMemoryProfile
+    counts?: { reviews: number; lessons: number; knowledge: number }
+    last_review_day?: string | null
+    last_review_at?: string | null
+    last_error?: string | null
+    seed_ready?: boolean
+    error?: string
+  }
+  reviews: PaperMemoryReview[]
+  lessons: PaperMemoryLesson[]
+  knowledge: PaperMemoryKnowledge[]
+  schedule: { enabled: boolean; hour: number; minute: number }
+}
+
+export interface PaperMemoryReviewRunResult {
+  ok: boolean
+  day?: string
+  error?: string
+  skipped?: string
+  lessons_saved?: number
+  knowledge_saved?: number
+}
+
+// ── 智能体 ↔ LLM 对话记录 / 用户提问 ──
+export interface PaperConversationTurn {
+  id: string
+  ts: string
+  account: string
+  /** debate=五派辩论（每派每轮一条，结论交海平终判） */
+  channel: 'decision' | 'review' | 'risk' | 'chat' | 'debate'
+  /** 内容（decision=发给模型的上下文JSON，review=当日事实，chat=用户问题，
+   *  risk=触发兜底时的盘口快照——**该通道未调用模型**；debate=该派该轮看到的事实；
+   *  列表视图为 null */
+  request: string | null
+  request_chars?: number
+  /** 模型回复全文（risk 通道为代码判定理由；debate 通道为该派本轮发言） */
+  response: string
+  /** 解析出的结构化结果（决策/复盘） */
+  parsed: Record<string, unknown> | null
+  meta: Record<string, unknown>
+  elapsed_ms?: number | null
+  system_chars?: number
+  error?: string | null
+}
+
+export interface PaperConversationPayload {
+  turns: PaperConversationTurn[]
+  stats: { total: number; by_channel: Record<string, number>; last_ts?: string | null }
+  labels: Record<string, string>
+}
+
+export interface PaperChatEvent {
+  type: 'meta' | 'delta' | 'done' | 'error' | 'ping'
+  content?: string
+  message?: string
+  model?: string
+  turn_id?: string
 }
 
 /** 多账户横向对比行 (GET /api/paper/compare): 概览 + 回合统计 + 定版净值 */
@@ -2058,6 +2285,10 @@ export interface SettingsState {
   ai_max_output_tokens?: number
   ai_context_window?: number
   ai_round_checkpoint?: number
+  /** 分组模型（空串 = 跟随 ai_model）: 对话 / 分析 / 策略 */
+  ai_model_chat?: string
+  ai_model_analysis?: string
+  ai_model_strategy?: string
 }
 
 /** 保存 TickFlow Key 的响应(先探后存) */
@@ -2434,8 +2665,8 @@ export const api = {
     ),
 
   /** 保存 AI 配置 */
-  saveAiSettings: (ai: { provider?: string; base_url?: string; api_key?: string; model?: string; reasoning_effort?: string; codex_command?: string; codex_reasoning_effort?: string; user_agent?: string; max_output_tokens?: number; context_window?: number; round_checkpoint?: number }) =>
-    request<{ ok: boolean; ai_provider?: string; ai_model?: string; ai_openai_model?: string; ai_reasoning_effort?: string; ai_codex_model?: string; ai_codex_command?: string; ai_codex_reasoning_effort?: string; ai_configured?: boolean; ai_max_output_tokens?: number; ai_context_window?: number; ai_round_checkpoint?: number }>('/api/settings/ai', {
+  saveAiSettings: (ai: { provider?: string; base_url?: string; api_key?: string; model?: string; reasoning_effort?: string; codex_command?: string; codex_reasoning_effort?: string; user_agent?: string; max_output_tokens?: number; context_window?: number; round_checkpoint?: number; model_chat?: string; model_analysis?: string; model_strategy?: string }) =>
+    request<{ ok: boolean; ai_provider?: string; ai_model?: string; ai_openai_model?: string; ai_reasoning_effort?: string; ai_codex_model?: string; ai_codex_command?: string; ai_codex_reasoning_effort?: string; ai_configured?: boolean; ai_max_output_tokens?: number; ai_context_window?: number; ai_round_checkpoint?: number; ai_model_chat?: string; ai_model_analysis?: string; ai_model_strategy?: string }>('/api/settings/ai', {
       method: 'POST',
       body: JSON.stringify(ai),
     }),
@@ -4054,6 +4285,15 @@ export const api = {
     /** 价格档位（硬规则，命中即执行，优先于 LLM 判断；0 = 不启用） */
     llm_price_add_half?: number; llm_price_reduce_half?: number
     llm_price_full?: number; llm_price_exit_all?: number
+    /** 五派辩论（账户级） */
+    llm_debate_enabled?: boolean; llm_debate_rounds?: number; llm_debate_daily_max?: number
+    /** 分组模型（空串 = 跟随全局 AI 设置）: 海平决策/终判 与 四派顾问 各用哪个 */
+    llm_model?: string; llm_debate_model?: string
+    /** 收盘复盘用的模型（空串 = 跟随「分析」组，再跟随全局） */
+    llm_review_model?: string
+    /** 四派逐派模型（空串 = 回落到 llm_debate_model，再回落全局） */
+    llm_debate_model_caishen?: string; llm_debate_model_chanlun?: string
+    llm_debate_model_canslim?: string; llm_debate_model_kxian?: string
   }, account?: string) =>
     request<{ account: PaperAccount }>(accUrl('/api/paper/settings', account), {
       method: 'POST',
@@ -4067,6 +4307,108 @@ export const api = {
   /** LLM 触发统计：四个形态各触发几次/何时 + 决策结果 + 未下单原因 */
   paperLlmStats: (account?: string, days = 7) =>
     request<PaperLlmStats>(accUrl(`/api/paper/llm_stats?days=${days}`, account)),
+
+  // ── 智能体记忆 / 知识库 / 每日收盘复盘 ──
+  /** 记忆总览: 自我画像 + 最近复盘 + 经验教训 + 知识库 + 复盘调度 */
+  paperMemory: (account?: string, reviews = 10) =>
+    request<PaperMemoryPayload>(accUrl(`/api/paper/memory?reviews=${reviews}`, account)),
+
+  /** 立即跑一次收盘复盘（已复盘过需 force 重跑） */
+  paperMemoryReviewRun: (account?: string, day?: string, force = false) => {
+    const q = new URLSearchParams()
+    if (day) q.set('day', day)
+    if (force) q.set('force', 'true')
+    const s = q.toString()
+    return request<PaperMemoryReviewRunResult>(
+      accUrl(`/api/paper/memory/review${s ? `?${s}` : ''}`, account), { method: 'POST' })
+  },
+
+  paperMemoryKnowledgeAdd: (body: { title: string; body?: string; tags?: string[] }, account?: string) =>
+    request<{ knowledge: PaperMemoryKnowledge }>(accUrl('/api/paper/memory/knowledge', account), {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  paperMemoryKnowledgeDelete: (id: string, account?: string) =>
+    request<{ ok: boolean }>(
+      accUrl(`/api/paper/memory/knowledge/${encodeURIComponent(id)}`, account), { method: 'DELETE' }),
+
+  /** 归档一条经验（归档后不再注入决策提示词） */
+  paperMemoryLessonArchive: (id: string, account?: string) =>
+    request<{ ok: boolean }>(
+      accUrl(`/api/paper/memory/lessons/${encodeURIComponent(id)}`, account), { method: 'DELETE' }),
+
+  /** 复盘调度（全局，与大盘复盘独立） */
+  paperMemoryScheduleSet: (body: { enabled: boolean; hour: number; minute: number }) =>
+    request<{ enabled: boolean; hour: number; minute: number }>('/api/paper/memory/schedule', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+
+  // ── 智能体 ↔ LLM 对话记录 / 用户提问 ──
+  /** 对话记录（新→旧）。channel: decision 盘中决策 / review 收盘复盘 / chat 我的提问 */
+  paperConversation: (account?: string, channel?: string, limit = 50, withRequest = false) => {
+    const q = new URLSearchParams()
+    if (channel) q.set('channel', channel)
+    q.set('limit', String(limit))
+    if (withRequest) q.set('with_request', 'true')
+    return request<PaperConversationPayload>(accUrl(`/api/paper/conversation?${q.toString()}`, account))
+  },
+
+  /** 单条对话往返全文（含发给模型的请求体） */
+  paperConversationTurn: (turnId: string, account?: string) =>
+    request<{ turn: PaperConversationTurn }>(
+      accUrl(`/api/paper/conversation/${encodeURIComponent(turnId)}`, account)),
+
+  paperConversationClear: (account?: string) =>
+    request<{ ok: boolean; removed: number }>(accUrl('/api/paper/conversation', account), { method: 'DELETE' }),
+
+  /** **手动召集五派辩论**（只出结论, 不下单）: 4 派 × rounds 轮模型调用,
+   *  即使 rounds=1 也要 4 次调用 —— 实测 3 轮约 2~3 分钟, 故用大幅放宽的超时
+   *  (默认 30s 会先于后端结果触发 abort, 把长任务误报成"请求超时")。
+   *  注意: 该路由的账户由 **body.account** 决定（query 参数不参与），两处都带上更稳。 */
+  paperDebateRun: (account: string, rounds = 3) =>
+    request<PaperDebateResult>(accUrl('/api/paper/debate', account), {
+      method: 'POST',
+      body: JSON.stringify({ account, rounds }),
+      timeoutMs: DEBATE_REQUEST_TIMEOUT_MS,
+    }),
+
+  /** 向智能体提问 — 流式 NDJSON（只做分析问答，不会下单）。 */
+  async *paperChatStream(account: string, question: string): AsyncGenerator<PaperChatEvent> {
+    const res = await fetch(accUrl('/api/paper/chat/stream', account), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+    })
+    if (!res.ok) {
+      let detail = ''
+      try { const j = JSON.parse(await res.text()); detail = j.detail ?? j.message ?? '' } catch { /* ignore */ }
+      const msg = detail || `${res.status} ${res.statusText}`
+      toast(msg, 'error')
+      throw new Error(msg)
+    }
+    if (!res.body) throw new Error('响应无 body')
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      for (const line of lines) {
+        const s = line.trim()
+        if (!s) continue
+        try { yield JSON.parse(s) as PaperChatEvent } catch { /* ignore */ }
+      }
+    }
+    if (buf.trim()) {
+      try { yield JSON.parse(buf.trim()) as PaperChatEvent } catch { /* ignore */ }
+    }
+  },
 
   paperOrderCreate: (body: { symbol: string; side: 'buy' | 'sell'; qty?: number; amount?: number; order_type: 'market' | 'next_open' | 'close'; ref_price?: number }, account?: string) =>
     request<{ order: PaperOrder }>(accUrl('/api/paper/orders', account), {
@@ -4546,3 +4888,4 @@ export interface AnalysisMenu {
   updated_at?: string | null
   builtin?: boolean
 }
+

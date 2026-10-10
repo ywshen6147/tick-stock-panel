@@ -34,6 +34,7 @@ interface NavEntry {
 const BUILTIN_PAGES: NavEntry[] = [
   { id: '/', label: '看板', type: 'builtin', visible: true },
   { id: '/watchlist', label: '自选', type: 'builtin', visible: true },
+  { id: '/paper', label: '模拟盘', type: 'builtin', visible: true },
   { id: '/screener', label: '策略', type: 'builtin', visible: true },
   { id: '/factors', label: '因子', type: 'builtin', visible: true },
   { id: '/backtest', label: '回测', type: 'builtin', visible: true },
@@ -46,7 +47,6 @@ const BUILTIN_PAGES: NavEntry[] = [
   { id: '/regime', label: '市场环境', type: 'builtin', visible: true },
   { id: '/abnormal', label: '异动监控', type: 'builtin', visible: true },
   { id: '/lots', label: '持仓提醒', type: 'builtin', visible: true },
-  { id: '/paper', label: '模拟盘', type: 'builtin', visible: true },
   { id: '/signals', label: '信号库', type: 'builtin', visible: true },
   { id: '/review', label: '复盘', type: 'builtin', visible: true },
   { id: '/indices', label: '指数', type: 'builtin', visible: true },

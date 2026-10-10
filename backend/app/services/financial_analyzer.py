@@ -172,7 +172,7 @@ async def analyze_financials_stream(
 
     # 3. 调用 LLM 流式
     try:
-        from app.services.ai_provider import stream_ai_text
+        from app.services.ai_provider import stream_ai_text, role_model
 
         user_prompt = _build_user_prompt(fins, symbol, focus)
         got_content = False
@@ -185,6 +185,8 @@ async def analyze_financials_stream(
             # 不限制输出(推理模型思考 token 计入预算, 见 ai_provider.stream_ai_text)
             max_tokens=None,
             prefer_final_answer=True,
+            # 分组模型：「分析」组，可在 设置→AI 配置
+            model=role_model("analysis"),
         ):
             got_content = True
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)

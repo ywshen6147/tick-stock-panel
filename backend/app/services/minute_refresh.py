@@ -68,6 +68,10 @@ _EMPTY_ROUNDS_TO_REPAIR = 2
 # 仅修复轮的自定义源 (无 get_intraday_latest 廉价增量): 全天批量节奏下限,
 # 6s 一轮全市场拉取会把绝大多数源打爆。
 _REPAIR_ONLY_MIN_INTERVAL_S = 60
+# 合成分钟数据落盘目录名: 实时快照合成的K (stocksdk 等) 写独立目录, 不进入
+# kline_minute 主分区 — 合成K无真实 OHLC/量额, 进主分区会覆盖同分钟真实分钟K,
+# 污染个股分时/分时信号。TickFlow 真实分钟源仍写 kline_minute 主分区。
+_SYNTHETIC_MINUTE_DIR_NAME = "kline_minute_rt"
 
 
 def _in_continuous_session(now=None) -> bool:
@@ -186,6 +190,23 @@ class MinuteRefreshService:
         provider, name = self._resolve_custom()
         return provider is not None and not self._custom_supports_increment(provider)
 
+    def writes_main_partition(self) -> bool:
+        """本服务是否把数据写入 kline_minute 主分区 (真实分钟K)。
+
+        True 仅当全量分钟源是 TickFlow (Expert, intraday.universe) — 落盘的是
+        真实分钟K, 可被个股分时/分时信号等真实分钟消费方信任。stocksdk 等
+        实时快照合成源写独立目录 (kline_minute_rt), 只服务板块轮动聚合等
+        不需要真实 OHLC/量额的消费方, 不进入真实分钟主分区。
+        """
+        provider, _name = self._resolve_custom()
+        return provider is None  # tickflow 路径
+
+    def _minute_dir(self):
+        """本轮数据落盘目录: 真实分钟源写主分区, 合成源写独立目录。"""
+        if self.writes_main_partition():
+            return self._repo.store.data_dir / "kline_minute"
+        return self._repo.store.data_dir / _SYNTHETIC_MINUTE_DIR_NAME
+
     def _effective_interval(self) -> int:
         """本轮间隔: 偏好值; 仅修复轮的自定义源下限 60s (全天批量打不住 6s 节奏)。"""
         interval = preferences.get_minute_refresh_interval()
@@ -252,7 +273,7 @@ class MinuteRefreshService:
         """
         with contextlib.suppress(Exception):
             part = (
-                self._repo.store.data_dir / "kline_minute"
+                self._minute_dir()
                 / f"date={cn_today().isoformat()}" / "part.parquet"
             )
             if not part.exists():
@@ -327,7 +348,7 @@ class MinuteRefreshService:
             self._empty_rounds = 0
             write_started = time.perf_counter()
             written = kline_sync._write_minute_partition(
-                df, self._repo.store.data_dir / "kline_minute",
+                df, self._minute_dir(),
             )
             write_ms = (time.perf_counter() - write_started) * 1000
 
@@ -356,11 +377,12 @@ class MinuteRefreshService:
     # ------------------------------------------------------------------
 
     def is_healthy(self) -> bool:
-        """读侧 freshness 判定: 本地 kline_minute 分区是否正被服务持续写入。
+        """读侧 freshness 判定: 服务正按间隔持续落盘 (无论主分区或合成目录)。
 
         条件: 偏好开启 + 轮询线程存活 + 最近一轮距现在 ≤ max(2*间隔, 30s)。
-        健康时消费方 (自选分时等) 可信任本地分区、跳过批量补拉;
-        连续失败轮不更新 last_round_at → 自动超时判不健康, 无需单独盯 last_error。
+        注意: 消费方需要"真实分钟主分区"时须额外检查 writes_main_partition()
+        (合成源写独立目录, 不维护主分区); 连续失败轮不更新 last_round_at →
+        自动超时判不健康, 无需单独盯 last_error。
         """
         try:
             if not preferences.get_minute_refresh_enabled():
@@ -389,6 +411,7 @@ class MinuteRefreshService:
             "provider": self.active_provider(),
             "provider_effective": self._resolve_custom()[1],
             "repair_only": self.repair_only(),
+            "writes_main_partition": self.writes_main_partition(),
             "interval_seconds": preferences.get_minute_refresh_interval(),
             "capability_ok": self.capability_ok(),
             "in_trading_hours": _in_continuous_session(),

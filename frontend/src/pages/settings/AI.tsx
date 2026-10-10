@@ -58,13 +58,44 @@ const codexModelLabel = (model?: string, effort?: string) => {
   return effortLabel ? `${modelLabel} · ${effortLabel}` : modelLabel
 }
 
-type AiPreset = { label: string; provider?: string; url: string; model: string; codexCommand?: string; website: string; websiteLabel: string; description: ReactNode; custom?: boolean; sponsor?: boolean }
+type AiPreset = { label: string; provider?: string; url: string; model: string; models?: string[]; codexCommand?: string; website: string; websiteLabel: string; description: ReactNode; custom?: boolean; sponsor?: boolean }
+
+// 可下拉选择的模型清单（preset 声明后，模型框右侧出现下拉，不再需要手打模型名）
+// 均为 2026-10-10 用真实 Key 实测通过的 ID（GET /models 或逐个 chat/completions 试）。
+const DEEPSEEK_MODELS = [
+  'deepseek-v4-pro',      // 实测 200（DeepSeek 官方账号当前只有这个 + deepseek-flash）
+  'deepseek-v4-flash',
+  'deepseek-flash',
+]
+
+// 火山方舟 Agent Plan: OpenAI 兼容入口是 /api/plan/v3（Anthropic 兼容是 /api/plan）。
+// 以下 13 个 ID 已用本机 Agent Plan Key 在 /api/plan/v3 + chat/completions 下逐个实测 200。
+// 注意: 该网关**不提供** /models 接口；ID 不是平台 /api/v3 的 dash+日期戳命名。
+const ARK_AGENT_PLAN_MODELS = [
+  'deepseek-v4-pro',
+  'deepseek-v4-flash',
+  'deepseek-v4-flash-vision-exp',
+  'doubao-seed-evolving',
+  'doubao-seed-2.1-pro',
+  'doubao-seed-2.1-turbo',
+  'doubao-seed-2.0-lite',
+  'doubao-seed-2.0-mini',
+  'glm-5.3',
+  'glm-5.3-flash',
+  'kimi-k3',
+  'kimi-k2.7-code',
+  'minimax-m3',
+]
+
+// 分组模型（对话 / 分析 / 策略）的下拉候选：与模拟盘共用同一批实测可用 ID
+const AI_ROLE_MODEL_OPTIONS = Array.from(new Set([...ARK_AGENT_PLAN_MODELS, 'deepseek-flash']))
 
 const PRESETS: AiPreset[] = [
   { label: '自定义', url: '', model: '', website: '', websiteLabel: '', description: '不自动填充任何配置，完全手动填写 API 地址、模型和密钥。', custom: true },
   { label: 'RunningHub', url: 'https://llm.runninghub.ai/v1', model: 'openai/gpt-6-astra-saver', website: 'https://www.runninghub.ai/zh-cn/call-api/llm/models?source=github&inviteCode=edt5wh7c', websiteLabel: 'www.runninghub.ai · 赞助', sponsor: true, description: <>本项目赞助商 · OpenAI 兼容中转，单一接口直连 400+ 主流大模型，<span className="font-medium text-amber-600 dark:text-amber-400">Claude、ChatGPT、Gemini</span> 等国际模型直连稳定不掉线，<span className="font-medium text-amber-600 dark:text-amber-400">最高优惠 80%</span>，<span className="font-medium text-amber-600 dark:text-amber-400">邀请链接注册赠送 1000 RH 积分</span>。通过下方链接注册即为项目提供赞助支持。</> },
   { label: 'OpenAI', provider: OPENAI_PROVIDER, url: 'https://api.openai.com/v1', model: DEFAULT_OPENAI_MODEL, website: 'https://platform.openai.com/', websiteLabel: 'platform.openai.com', description: 'OpenAI 官方接口，可单独配置模型支持的推理强度。' },
-  { label: 'DeepSeek', url: 'https://api.deepseek.com', model: 'deepseek-v4-pro', website: 'https://www.deepseek.com/', websiteLabel: 'deepseek.com', description: 'DeepSeek 官方 OpenAI 兼容接口。' },
+  { label: 'DeepSeek', url: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro', models: DEEPSEEK_MODELS, website: 'https://www.deepseek.com/', websiteLabel: 'deepseek.com', description: <>DeepSeek 官方 OpenAI 兼容接口，默认 <code className="font-mono text-[10px]">deepseek-v4-pro</code>（点右侧下拉可切换）。注意：官方账号当前仅支持 <code className="font-mono text-[10px]">deepseek-v4-pro</code> / <code className="font-mono text-[10px]">deepseek-flash</code>，传其它名字会 400。</> },
+  { label: '火山 Agent Plan', url: 'https://ark.cn-beijing.volces.com/api/plan/v3', model: 'deepseek-v4-pro', models: ARK_AGENT_PLAN_MODELS, website: 'https://console.volcengine.com/ark', websiteLabel: 'console.volcengine.com/ark', description: <>火山方舟 <span className="font-medium text-accent">Agent Plan</span> 套餐（OpenAI 兼容入口 <code className="font-mono text-[10px]">/api/plan/v3</code>）· <span className="font-medium text-accent">一把套餐 Key 驱动 13 个模型</span>：豆包 Seed 2.0/2.1、DeepSeek、GLM 5.3、Kimi、MiniMax。模型 ID 为点号命名（如 <code className="font-mono text-[10px]">deepseek-v4-pro</code>）；该网关不提供 /models 列表接口。</> },
   { label: '通义千问', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-3.6plus', website: 'https://tongyi.aliyun.com/', websiteLabel: 'tongyi.aliyun.com', description: '阿里云 DashScope 兼容模式接口。' },
   { label: '智谱 GLM', url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-5.2', website: 'https://open.bigmodel.cn/', websiteLabel: 'open.bigmodel.cn', description: '智谱 AI 官方 OpenAI 兼容接口。' },
   { label: 'Kimi', url: 'https://api.moonshot.cn/v1', model: 'kimi-k2.7-code', website: 'https://platform.moonshot.cn/', websiteLabel: 'platform.moonshot.cn', description: '月之暗面 Moonshot 官方 OpenAI 兼容接口，支持超长上下文。' },
@@ -95,6 +126,10 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
   const [maxOutputTokens, setMaxOutputTokens] = useState('')
   const [contextWindow, setContextWindow] = useState('')
   const [roundCheckpoint, setRoundCheckpoint] = useState('')
+  // 分组模型（空 = 跟随全局 model）
+  const [roleChat, setRoleChat] = useState('')
+  const [roleAnalysis, setRoleAnalysis] = useState('')
+  const [roleStrategy, setRoleStrategy] = useState('')
   const [showKey, setShowKey] = useState(false)
   const [saved, setSaved] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
@@ -119,6 +154,8 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
   const savedCodexProvider = s?.ai_provider === CODEX_PROVIDER
   const configured = s?.ai_configured ?? (savedCodexProvider ? !!(s?.ai_codex_command ?? CODEX_COMMAND) : s?.has_ai_key)
   const selectedPreset = PRESETS.find(p => p.label === selectedPresetLabel) ?? PRESETS[0]
+  // 模型框右侧是否显示下拉按钮: 赞助商预设(拉 /models) 或 预设自带模型清单
+  const hasModelPicker = !!selectedPreset?.sponsor || (selectedPreset?.models?.length ?? 0) > 0
   const configTitle = isCodexProvider ? 'Codex CLI 配置' : isOpenAIProvider ? 'OpenAI 配置' : selectedPreset.custom ? '自定义配置' : `${selectedPreset.label} 配置`
   const savedCodexModel = s?.ai_codex_model ?? (savedCodexProvider ? (s?.ai_model ?? '') : '')
   const savedCodexEffort = s?.ai_codex_reasoning_effort ?? ''
@@ -175,6 +212,9 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
     setMaxOutputTokens(String(s?.ai_max_output_tokens ?? 16384))
     setContextWindow(String(s?.ai_context_window ?? 128000))
     setRoundCheckpoint(String(s?.ai_round_checkpoint ?? 100))
+    setRoleChat(s?.ai_model_chat ?? '')
+    setRoleAnalysis(s?.ai_model_analysis ?? '')
+    setRoleStrategy(s?.ai_model_strategy ?? '')
   }, [s])
 
   const payload = () => ({
@@ -189,6 +229,9 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
     max_output_tokens: toPositiveInt(maxOutputTokens),
     context_window: toPositiveInt(contextWindow),
     round_checkpoint: toIntAllowZero(roundCheckpoint),
+    model_chat: roleChat.trim(),
+    model_analysis: roleAnalysis.trim(),
+    model_strategy: roleStrategy.trim(),
   })
 
   const save = useMutation({
@@ -210,6 +253,9 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
         ai_max_output_tokens: result.ai_max_output_tokens ?? toPositiveInt(maxOutputTokens),
         ai_context_window: result.ai_context_window ?? toPositiveInt(contextWindow),
         ai_round_checkpoint: result.ai_round_checkpoint ?? toIntAllowZero(roundCheckpoint),
+        ai_model_chat: result.ai_model_chat ?? roleChat.trim(),
+        ai_model_analysis: result.ai_model_analysis ?? roleAnalysis.trim(),
+        ai_model_strategy: result.ai_model_strategy ?? roleStrategy.trim(),
         ...(apiKey ? {
           has_ai_key: true,
           ai_api_key_masked: `${apiKey.slice(0, 4)}......${apiKey.slice(-4)}`,
@@ -312,11 +358,18 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
 
   // 赞助商预设: 经后端代理拉取 /models 全量模型列表供下拉选择
   // (浏览器直连会被 RunningHub 网关按 Origin 过滤, 只返回国产模型)
+  // 预设自带 models 清单时（DeepSeek / 火山 Agent Plan）直接用清单, 不请求 /models。
   const fetchModelOptions = async () => {
-    setModelsLoading(true)
-    setModelsError('')
     setModelFilter('')
     setModelsOpen(true)
+    if (selectedPreset?.models?.length) {
+      setModelOptions(selectedPreset.models)
+      setModelsError('')
+      setModelsLoading(false)
+      return
+    }
+    setModelsLoading(true)
+    setModelsError('')
     try {
       const data = await api.sponsorModels()
       setModelOptions(data.models)
@@ -466,14 +519,14 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
                 </Field>
                 <Field label="模型">
                   <div ref={modelBoxRef} className="relative">
-                    <input type="text" value={model} onChange={e => handleModelChange(e.target.value)} placeholder="gpt-5.6-sol" className={`${INPUT_CLS} ${selectedPreset?.sponsor ? 'pr-9' : ''}`} />
-                    {selectedPreset?.sponsor && (
+                    <input type="text" value={model} onChange={e => handleModelChange(e.target.value)} placeholder="gpt-5.6-sol" className={`${INPUT_CLS} ${hasModelPicker ? 'pr-9' : ''}`} />
+                    {hasModelPicker && (
                       <button type="button" onClick={fetchModelOptions} aria-label="获取模型列表"
                         className="absolute right-1.5 top-1/2 flex h-6 w-7 -translate-y-1/2 items-center justify-center rounded-md border border-border/40 bg-base text-muted transition-colors hover:border-accent/40 hover:text-accent">
                         {modelsLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ChevronDown className="h-3.5 w-3.5" />}
                       </button>
                     )}
-                    {selectedPreset?.sponsor && modelsOpen && (
+                    {hasModelPicker && modelsOpen && (
                       <div className="absolute z-20 mt-1 w-full rounded-lg border border-border/40 bg-base shadow-lg">
                         <div className="border-b border-border/30 p-2">
                           <input type="text" value={modelFilter} onChange={e => setModelFilter(e.target.value)}
@@ -562,6 +615,32 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
                 <input type="number" min={0} value={roundCheckpoint} onChange={e => setRoundCheckpoint(e.target.value)} placeholder="100" className={INPUT_CLS} />
               </Field>
             </div>
+          </div>
+
+          {/* ── 分组模型: 不同环节用不同模型（留空 = 跟随上面的全局模型）── */}
+          <div className="border-t border-border/20 pt-4">
+            <div className="mb-2 text-xs font-medium text-secondary">分组模型</div>
+            <div className="grid grid-cols-3 gap-4">
+              <Field label="对话 / 问答" hint={`AI 助手与模拟盘「我的提问」; 留空跟随全局 (${s?.ai_model || '当前模型'})`}>
+                <input list="ai-role-model-options" value={roleChat} onChange={e => setRoleChat(e.target.value)}
+                  placeholder={s?.ai_model || '跟随全局'} className={INPUT_CLS} />
+              </Field>
+              <Field label="分析（概念/行业/大盘/个股/财务）" hint="四类分析与收盘复盘; 留空跟随全局">
+                <input list="ai-role-model-options" value={roleAnalysis} onChange={e => setRoleAnalysis(e.target.value)}
+                  placeholder={s?.ai_model || '跟随全局'} className={INPUT_CLS} />
+              </Field>
+              <Field label="策略（选股/生成/迭代）" hint="AI 选股、策略生成与迭代; 留空跟随全局">
+                <input list="ai-role-model-options" value={roleStrategy} onChange={e => setRoleStrategy(e.target.value)}
+                  placeholder={s?.ai_model || '跟随全局'} className={INPUT_CLS} />
+              </Field>
+            </div>
+            <div className="mt-1 text-[10px] leading-relaxed text-muted/80">
+              建议: 对话用快模型（如 <span className="font-mono">doubao-seed-2.0-lite</span>）、分析用稳模型（如 <span className="font-mono">doubao-seed-2.1-pro</span>）、策略用强模型（如 <span className="font-mono">deepseek-v4-pro</span>）。
+              模拟盘的「海平 / 四派顾问 / 收盘复盘」模型在 <span className="text-secondary">模拟盘 → 自动跟单规则</span> 里按账户单独设置。
+            </div>
+            <datalist id="ai-role-model-options">
+              {AI_ROLE_MODEL_OPTIONS.map(m => <option key={m} value={m} />)}
+            </datalist>
           </div>
         </div>
       </Card>
@@ -690,3 +769,4 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: () => void 
     </button>
   )
 }
+

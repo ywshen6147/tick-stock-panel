@@ -210,6 +210,7 @@ def test_plugin_discovered_in_loader():
     assert plugins["stocksdk"]["runtime"] == "node"
     assert "daily" in plugins["stocksdk"]["datasets"]
     assert "realtime" in plugins["stocksdk"]["datasets"]
+    assert "full_minute" in plugins["stocksdk"]["datasets"]
     assert "financial" not in plugins["stocksdk"]["datasets"]
     assert cs.is_builtin("stocksdk")
     # 内置源不出现在用户自定义源列表
@@ -230,6 +231,7 @@ def test_plugin_registered_when_available(monkeypatch):
     assert cs.is_custom_provider("stocksdk")
     assert cs.provider_has_dataset("stocksdk", "daily")
     assert cs.provider_has_dataset("stocksdk", "realtime")
+    assert cs.provider_has_dataset("stocksdk", "full_minute")
     assert not cs.provider_has_dataset("stocksdk", "financial")
 
 
@@ -333,3 +335,76 @@ def test_get_minute_single_day_no_split(monkeypatch):
     StockSDKProvider().get_minute(["600519.SH"], datetime(2026, 8, 28), datetime(2026, 8, 28, 15, 0))
     assert len(jobs) == 1
     assert jobs[0]["start"] == "20260828"
+
+
+# ---------- full_minute (盘中全量分钟: 实时快照合成当前分钟K) ----------
+
+
+def _stub_realtime(monkeypatch, rows):
+    """把 get_realtime 换成桩数据, 不依赖真实网络。"""
+    p = StockSDKProvider()
+    monkeypatch.setattr(p, "get_realtime", lambda: rows)
+    return p
+
+
+def test_get_intraday_latest_builds_synthetic_current_minute_bars(monkeypatch):
+    rows = [
+        {"symbol": "600519.SH", "last_price": 1200.0, "name": "贵州茅台"},
+        {"symbol": "000001.SZ", "last_price": 12.34, "name": "平安银行"},
+        {"symbol": None, "last_price": 9.9},                  # 无效 symbol 剔除
+        {"symbol": "300750.SZ", "last_price": None},          # 无效 price 剔除
+    ]
+    df = _stub_realtime(monkeypatch, rows).get_intraday_latest(count=3)
+    assert df.height == 2
+    assert sorted(df["symbol"].to_list()) == ["000001.SZ", "600519.SH"]
+    # 合成K: OHLC 全等于最新价, volume/amount 为 0
+    for col in ("open", "high", "low", "close"):
+        assert (df[col] == df["close"]).all()
+    assert (df["volume"] == 0.0).all()
+    assert (df["amount"] == 0.0).all()
+    # datetime: 时区感知 (Asia/Shanghai), 截断到分钟
+    assert df.schema["datetime"].time_zone == "Asia/Shanghai"
+    assert df["datetime"][0].second == 0
+    assert df["datetime"][0].microsecond == 0
+
+
+def test_get_intraday_latest_empty_realtime_returns_empty(monkeypatch):
+    assert _stub_realtime(monkeypatch, []).get_intraday_latest().is_empty()
+
+
+def test_get_intraday_batch_is_bounded_and_never_pulls_day_history(monkeypatch):
+    """修复轮必须**有界**(不拉全天历史), 否则会卡住盘中增量轮。
+
+    全市场逐标的 cnMinute 拉一天实测 ≈15 分钟(4 并发); 修复轮持轮次锁 →
+    会把实时增量轮一并卡住, 盘中分时反而停摆。故 get_intraday_batch 与增量轮
+    同口径(实时快照合成当前分钟)并只按 symbols 过滤; 历史某日全天补齐走
+    backend/scripts/backfill_minute_day.py 的离线并发回补(不占轮次锁)。
+    """
+    rows = [
+        {"symbol": "600519.SH", "last_price": 1200.0},
+        {"symbol": "000001.SZ", "last_price": 12.34},
+        {"symbol": "300750.SZ", "last_price": 150.0},
+    ]
+    p = _stub_realtime(monkeypatch, rows)
+    calls = {"minute": 0}
+    monkeypatch.setattr(p, "get_minute", lambda *a, **k: calls.__setitem__("minute", calls["minute"] + 1))
+
+    df = p.get_intraday_batch(symbols=["600519.SH", "000001.SZ"], count=300)
+    assert sorted(df["symbol"].to_list()) == ["000001.SZ", "600519.SH"]
+    assert calls["minute"] == 0, "有界修复轮不得触发全天历史拉取"
+
+    # 不过滤 → 返回全部快照标的
+    assert _stub_realtime(monkeypatch, rows).get_intraday_batch().height == 3
+
+
+def test_full_minute_datetime_passes_wallclock_guard(monkeypatch):
+    """合成K的 tz-aware datetime 应通过 kline_sync 北京墙钟守卫 (含午休时刻)。"""
+    from app.services import kline_sync
+
+    rows = [{"symbol": "600519.SH", "last_price": 1200.0}]
+    df = _stub_realtime(monkeypatch, rows).get_intraday_latest()
+    out = kline_sync._enforce_minute_beijing_wallclock(df, source="stocksdk")
+    assert out.height == 1
+    # 守卫后为 naive 北京墙钟
+    assert out.schema["datetime"].time_zone is None
+    assert out["datetime"][0] == df["datetime"][0].replace(tzinfo=None)

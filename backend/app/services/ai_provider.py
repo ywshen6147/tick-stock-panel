@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -19,6 +21,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from app import secrets_store
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 OPENAI_COMPAT_PROVIDER = "openai_compat"
 OPENAI_PROVIDER = "openai"
@@ -142,6 +146,30 @@ def current_ai_model() -> str:
     if current_ai_provider() == CODEX_CLI_PROVIDER:
         return current_codex_model()
     return current_openai_model()
+
+
+# ── 分组模型：不同环节可用不同模型（空 = 跟随全局 ai_model）──────────────
+# 键存 secrets.json，由「设置 → AI」的「分组模型」区块写入。
+# 动机: 对话要快、分析要稳、策略生成要强 —— 一个模型难以同时最优；
+# 且推理型模型贵/慢, 用在轻量环节是浪费。
+ROLE_MODEL_KEYS: dict[str, str] = {
+    "chat": "ai_model_chat",          # 对话/问答（含模拟盘「我的提问」）
+    "analysis": "ai_model_analysis",  # 概念轮动 / 行业 / 大盘复盘 / 个股 / 财务 分析
+    "strategy": "ai_model_strategy",  # AI 选股 / 策略生成 / 迭代 / 策略详情
+}
+
+
+def role_model(role: str) -> str:
+    """取某环节配置的模型；未配置（空）返回 ""，调用方据此跟随全局模型。"""
+    key = ROLE_MODEL_KEYS.get(str(role or "").strip())
+    if not key:
+        return ""
+    return (secrets_store.get_ai_config(key, "") or "").strip()
+
+
+def role_model_keys() -> dict[str, str]:
+    """角色 → secrets 键名（供设置接口读写与前端展示）。"""
+    return dict(ROLE_MODEL_KEYS)
 
 
 def current_openai_reasoning_effort() -> str:
@@ -306,6 +334,7 @@ async def generate_ai_text(
     temperature: float | None = 0.3,
     max_tokens: int | None = 3000,
     timeout: float = 180.0,
+    model: str | None = None,
 ) -> str:
     """Return a complete AI response from the currently configured provider.
 
@@ -313,6 +342,9 @@ async def generate_ai_text(
     (如 deepseek reasoner 系)的思考 token 计入 max_tokens 预算, 显式限制
     会挤占正文甚至全部吃光(正文 0 字 + finish=length), 长分析类调用应放开。
     显式传入的数值会被钳制到配置的输出上限 (AI 设置可调)。
+
+    model: 可选的**单次调用模型覆盖**（None/空 = 用全局配置的模型）。
+    用于模拟盘「四派顾问 / 海平」分别指定模型 —— 两者可在同一账户下用不同模型。
     """
     max_tokens = _resolve_max_tokens(max_tokens)
     _check_input_budget(messages, max_tokens=max_tokens)
@@ -323,6 +355,7 @@ async def generate_ai_text(
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
+        model=model,
     )
 
 
@@ -335,6 +368,7 @@ async def generate_ai_text_with_tools(
     max_tokens: int | None = 3000,
     timeout: float = 180.0,
     max_rounds: int = 4,
+    model: str | None = None,
 ) -> list[dict]:
     """OpenAI 原生 tools 有界循环: 调用 → 逐条执行工具 → role:tool 回填 → 循环。
 
@@ -343,6 +377,7 @@ async def generate_ai_text_with_tools(
     execute_tool 为 async (name, args) -> dict, 返回 {"ok": bool, "result"|"error"},
     由调用方注入 (见 services.tool_catalog.execute_tool)。tools 是硬能力依赖
     (Codex CLI 无 tools= 协议), 故入口 fail-closed, 不做纯文本降级。
+    model: 单次调用的模型覆盖（None = 全局配置模型）。
     """
     if is_codex_cli_provider():
         raise RuntimeError("当前 AI 供应商不支持工具调用迭代, 请改用 OpenAI 兼容模型")
@@ -362,6 +397,7 @@ async def generate_ai_text_with_tools(
             max_tokens=max_tokens,
             timeout=timeout,
             tools=tool_schemas,
+            model=model,
         )
         if message is None:
             return req_messages
@@ -424,6 +460,7 @@ async def stream_ai_text(
     max_tokens: int | None = 4000,
     timeout: float = 180.0,
     prefer_final_answer: bool = False,
+    model: str | None = None,
 ) -> AsyncIterator[str]:
     """Yield text deltas from the configured provider.
 
@@ -432,6 +469,7 @@ async def stream_ai_text(
     lets compatible providers prioritize visible content over hidden reasoning.
 
     max_tokens=None 表示不限制输出(同 generate_ai_text 的说明)。
+    model: 单次调用的模型覆盖（None = 全局配置模型）。
     """
     max_tokens = _resolve_max_tokens(max_tokens)
     _check_input_budget(messages, max_tokens=max_tokens)
@@ -445,6 +483,7 @@ async def stream_ai_text(
         max_tokens=max_tokens,
         timeout=timeout,
         prefer_final_answer=prefer_final_answer,
+        model=model,
     ):
         yield chunk
 
@@ -455,12 +494,14 @@ async def _run_openai_once(
     temperature: float | None,
     max_tokens: int | None,
     timeout: float,
+    model: str | None = None,
 ) -> str:
     message = await _run_openai_message_once(
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
+        model=model,
     )
     if message is None:
         return ""
@@ -474,20 +515,31 @@ async def _run_openai_message_once(
     max_tokens: int | None,
     timeout: float,
     tools: Sequence[dict] | None = None,
+    model: str | None = None,
 ):
     """一次 OpenAI create() 调用, 返回完整 message (含 tool_calls, 而非仅 content)。
 
     _run_openai_once 只取 .content; 工具循环需要 .tool_calls 以回填 role:tool,
     故在此返回完整消息对象。tools 非空时以 tools= 透传, 否则走纯文本路径。
+    model: 单次调用的模型覆盖（None/空 = 全局配置模型）; 参数拒绝缓存的键也按
+    生效模型计算, 避免把 A 模型的限制误记到 B 模型上。
     """
     ai_key = secrets_store.get_ai_key()
     if not ai_key:
         raise RuntimeError("AI API Key 未配置, 请在设置页配置")
 
     client = _openai_client(ai_key, timeout)
-    model = current_ai_model()
+    model = (model or "").strip() or current_ai_model()
+    base_url = secrets_store.get_ai_config("ai_base_url", settings.ai_base_url)
+    target = (normalize_openai_base_url(base_url or ""), model)
     req_messages = list(messages)
-    kwargs = _openai_kwargs(temperature=temperature, max_tokens=max_tokens, tools=tools)
+    kwargs = _openai_kwargs(
+        temperature=temperature, max_tokens=max_tokens, tools=tools,
+        model=model, base_url=base_url,
+    )
+    # 整体重试额度: 覆盖长耗时请求中途被上游断连的情况 —— 非流式无部分产出,
+    # 重试安全。(client 的 max_retries=0, 重试全部由这里负责)
+    transport_retries_left = _TRANSPORT_MAX_RETRIES
     while True:
         try:
             resp = await client.chat.completions.create(
@@ -497,9 +549,18 @@ async def _run_openai_message_once(
             )
             break
         except Exception as exc:
-            retry_kwargs = _openai_retry_kwargs(exc, kwargs)
+            retry_kwargs = _openai_retry_kwargs(exc, kwargs, target=target)
             if retry_kwargs is not None:
                 kwargs = retry_kwargs
+                continue
+            if transport_retries_left > 0 and _is_retryable_transport(exc):
+                used = _TRANSPORT_MAX_RETRIES - transport_retries_left
+                transport_retries_left -= 1
+                logger.warning(
+                    "openai 请求传输失败, 整体重试(%s/%s): %s",
+                    used + 1, _TRANSPORT_MAX_RETRIES, _format_openai_error(exc),
+                )
+                await asyncio.sleep(_TRANSPORT_RETRY_DELAY_S * (used + 1))
                 continue
             if _is_openai_transport_error(exc):
                 raise RuntimeError(_format_openai_error(exc)) from exc
@@ -516,13 +577,14 @@ async def _stream_openai(
     max_tokens: int | None,
     timeout: float,
     prefer_final_answer: bool,
+    model: str | None = None,
 ) -> AsyncIterator[str]:
     ai_key = secrets_store.get_ai_key()
     if not ai_key:
         raise RuntimeError("AI API Key 未配置, 请在设置页配置")
 
     client = _openai_client(ai_key, timeout)
-    model = current_ai_model()
+    model = (model or "").strip() or current_ai_model()
     base_url = secrets_store.get_ai_config("ai_base_url", settings.ai_base_url)
     req_messages = list(messages)
 
@@ -533,32 +595,63 @@ async def _stream_openai(
         base_url=base_url,
         prefer_final_answer=prefer_final_answer,
     )
+    target = (normalize_openai_base_url(base_url or ""), model)
+    # 整体重试额度: 只在"尚未产出任何内容"时可用 —— 一旦 yield 过 chunk 就不能重来
+    # (会让调用方看到重复文本)。client 的 max_retries=0, 重试全部由这里负责。
+    transport_retries_left = _TRANSPORT_MAX_RETRIES
+    yielded_any = False
     while True:
+        redo = False
+        while True:
+            try:
+                stream = await client.chat.completions.create(
+                    model=model,
+                    messages=req_messages,
+                    **kwargs,
+                    stream=True,
+                )
+                break
+            except Exception as exc:
+                # 流尚未开始 yield, 可安全移除被拒绝的可选参数后重建。
+                retry_kwargs = _openai_retry_kwargs(exc, kwargs, target=target)
+                if retry_kwargs is not None:
+                    kwargs = retry_kwargs
+                    continue
+                if transport_retries_left > 0 and _is_retryable_transport(exc):
+                    used = _TRANSPORT_MAX_RETRIES - transport_retries_left
+                    transport_retries_left -= 1
+                    logger.warning(
+                        "openai 流建立失败, 整体重试(%s/%s): %s",
+                        used + 1, _TRANSPORT_MAX_RETRIES, _format_openai_error(exc),
+                    )
+                    redo = True
+                    redo_delay = _TRANSPORT_RETRY_DELAY_S * (used + 1)
+                    break
+                if _is_openai_transport_error(exc):
+                    raise RuntimeError(_format_openai_error(exc)) from exc
+                raise
+        if redo:
+            await asyncio.sleep(redo_delay)
+            continue
+
         try:
-            stream = await client.chat.completions.create(
-                model=model,
-                messages=req_messages,
-                **kwargs,
-                stream=True,
-            )
-            break
+            async for piece in _iter_openai_text(stream):
+                yielded_any = True
+                yield piece
+            return
         except Exception as exc:
-            # 流尚未开始 yield, 可安全移除被拒绝的可选参数后重建。
-            retry_kwargs = _openai_retry_kwargs(exc, kwargs)
-            if retry_kwargs is not None:
-                kwargs = retry_kwargs
+            if transport_retries_left > 0 and not yielded_any and _is_retryable_transport(exc):
+                used = _TRANSPORT_MAX_RETRIES - transport_retries_left
+                transport_retries_left -= 1
+                logger.warning(
+                    "openai 流在首包前中断, 整体重试(%s/%s): %s",
+                    used + 1, _TRANSPORT_MAX_RETRIES, _format_openai_error(exc),
+                )
+                await asyncio.sleep(_TRANSPORT_RETRY_DELAY_S * (used + 1))
                 continue
             if _is_openai_transport_error(exc):
                 raise RuntimeError(_format_openai_error(exc)) from exc
             raise
-
-    try:
-        async for piece in _iter_openai_text(stream):
-            yield piece
-    except Exception as exc:
-        if _is_openai_transport_error(exc):
-            raise RuntimeError(_format_openai_error(exc)) from exc
-        raise
 
 
 _LENGTH_FINISH_REASONS = {"length", "max_tokens", "max_output_tokens"}
@@ -616,10 +709,11 @@ def _openai_client(api_key: str, timeout: float):
         api_key=api_key,
         base_url=normalize_openai_base_url(secrets_store.get_ai_config("ai_base_url", settings.ai_base_url)),
         timeout=timeout,
-        # SDK 层重试仅覆盖首包前的连接错误/超时/429/5xx, 此时尚未产出任何内容,
-        # 重试安全; 首 chunk 之后的断流不在此列, 由上层协议报错处理。
-        # 根因: DeepSeek 等上游高峰过载时首包失败率高, max_retries=0 导致一次抖动即终止。
-        max_retries=2,
+        # 重试策略收归上层(_is_retryable_transport + 整体重试), 不用 SDK 自带重试:
+        # SDK 对 429 无条件重试, 而"余额/额度不足"这类 429 重试毫无意义(充值不是
+        # 秒级动作) —— 实测 2026-10-10 moonshot 余额耗尽, 一次调用白跑 3 个请求。
+        # 上层的判据已区分限流(可重试)与余额(不可重试), 并覆盖首包前/后的断流。
+        max_retries=0,
         default_headers={"User-Agent": user_agent},
     )
 
@@ -671,19 +765,30 @@ def _openai_error_param(exc: Exception) -> str:
     return str(body.get("param") or "").strip().lower()
 
 
-def _openai_retry_kwargs(exc: Exception, kwargs: dict) -> dict | None:
-    """Remove one explicitly rejected optional argument for a bounded retry."""
+def _openai_retry_kwargs(
+    exc: Exception,
+    kwargs: dict,
+    *,
+    target: tuple[str, str] | None = None,
+) -> dict | None:
+    """Remove one explicitly rejected optional argument for a bounded retry.
+
+    被移除的参数会按 ``target``（模型/端点）记进进程内缓存, 后续同类调用不再发送。
+    """
     retry_kwargs = dict(kwargs)
     if "temperature" in retry_kwargs and _is_temperature_rejected(exc):
         retry_kwargs.pop("temperature")
+        _remember_rejected_param("temperature", target)
         return retry_kwargs
     if "reasoning_effort" in retry_kwargs and _is_reasoning_effort_rejected(exc):
         retry_kwargs.pop("reasoning_effort")
+        _remember_rejected_param("reasoning_effort", target)
         return retry_kwargs
     if "extra_body" in retry_kwargs and _is_thinking_body_rejected(exc):
         # DeepSeek thinking 禁用参数被拒 (模型/API 版本差异): 回退默认思考模式
         # 重试; 报告若因此被推理挤占正文, 由 _iter_openai_text 显式报错。
         retry_kwargs.pop("extra_body")
+        _remember_rejected_param("extra_body", target)
         return retry_kwargs
     return None
 
@@ -725,6 +830,14 @@ def _openai_kwargs(
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     if tools:
         kwargs["tools"] = list(tools)
+    # 已确认被"该模型"拒绝的可选参数不再重复发送: 省掉一次注定 400 的往返。
+    # 目标键按本次调用的 model/base_url 计算(显式传入时不被当前配置干扰)。
+    target = (
+        normalize_openai_base_url(base_url) if base_url else _ai_target_key()[0],
+        model or _ai_target_key()[1],
+    )
+    for param in _rejected_params_for(target):
+        kwargs.pop(param, None)
     return kwargs
 
 
@@ -743,6 +856,94 @@ def _is_openai_transport_error(exc: Exception) -> bool:
         return False
 
     return isinstance(exc, httpx.HTTPError)
+
+
+def _is_retryable_transport(exc: Exception) -> bool:
+    """可安全**整体重试**的传输类错误（与参数类 400 区分）。
+
+    注意 `_is_openai_transport_error` 对任何 `openai.APIError` 都返回 True
+    （含 400 参数错误），不能直接拿来判断重试 —— 对 400/401/404 重试只是白跑一趟。
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if status is not None:
+        if int(status) == 429:
+            # 限流类 429 可重试; 但**余额/额度类** 429 重试毫无意义（充值是人工
+            # 动作, 1.5 秒后不会变）, 还会把"余额不足"误报成"传输失败"并白跑一次
+            # 请求。实测 2026-10-10: moonshot 余额耗尽返回
+            # 429 exceeded_current_quota_error + "suspended due to insufficient balance"。
+            low = (str(getattr(exc, "body", None) or "") + str(exc)).lower()
+            if any(k in low for k in ("insufficient", "quota", "balance", "suspended",
+                                      "billing", "arrears", "欠费", "余额")):
+                return False
+            return True
+        return int(status) in (408, 409) or int(status) >= 500
+    name = exc.__class__.__name__
+    if "Connection" in name or "Timeout" in name:
+        return True
+    try:
+        import httpx
+    except ImportError:
+        return False
+    return isinstance(exc, (httpx.TransportError, httpx.TimeoutException))
+
+
+# ── 按模型记住"上游明确拒绝的可选参数"（进程内缓存）─────────────────────
+# 实测: kimi-k2.7-code 只接受 temperature=1 → 每轮复盘都先吃一个 400 再重试。
+# 记住后不再重复发那次注定失败的请求。键 = (规范化 base_url, model):
+# 换模型 / 换端点会重新探测, 不会把 A 模型的限制误用到 B 模型。
+_REJECTED_PARAMS: dict[tuple[str, str], set[str]] = {}
+_REJECTED_PARAMS_LOCK = threading.Lock()
+
+# 传输类失败后的整体重试: 次数与退避(秒)。重试策略由本模块统一负责
+# (client 的 max_retries=0), 因此这里要覆盖原先 SDK 提供的两次重试。
+_TRANSPORT_MAX_RETRIES = 2
+_TRANSPORT_RETRY_DELAY_S = 1.5
+
+
+def _ai_target_key() -> tuple[str, str]:
+    """当前配置的 (规范化 base_url, model)。"""
+    try:
+        base = normalize_openai_base_url(
+            secrets_store.get_ai_config("ai_base_url", settings.ai_base_url) or ""
+        )
+    except Exception:  # noqa: BLE001 — 配置读取异常不应影响主流程
+        base = ""
+    try:
+        model = current_ai_model()
+    except Exception:  # noqa: BLE001
+        model = ""
+    return (base or "", model or "")
+
+
+def _rejected_params_for(target: tuple[str, str]) -> set[str]:
+    with _REJECTED_PARAMS_LOCK:
+        return set(_REJECTED_PARAMS.get(target) or ())
+
+
+def _remember_rejected_param(param: str, target: tuple[str, str] | None = None) -> None:
+    if not param:
+        return
+    key = target or _ai_target_key()
+    with _REJECTED_PARAMS_LOCK:
+        _REJECTED_PARAMS.setdefault(key, set()).add(param)
+    logger.info(
+        "AI 可选参数降级已记住: model=%s base=%s 不再发送 %s", key[1], key[0], param,
+    )
+
+
+def reset_rejected_params_cache() -> None:
+    """清空缓存（设置页改模型/端点后可调用；测试用它避免相互污染）。"""
+    with _REJECTED_PARAMS_LOCK:
+        _REJECTED_PARAMS.clear()
+
+
+def rejected_params_snapshot() -> dict[str, list[str]]:
+    """诊断用：当前已记住哪些模型拒绝哪些参数。"""
+    with _REJECTED_PARAMS_LOCK:
+        return {f"{base} {model}": sorted(v) for (base, model), v in _REJECTED_PARAMS.items()}
 
 
 def _format_openai_error(exc: Exception) -> str:

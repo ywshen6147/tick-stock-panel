@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Lock, Plus, Settings2, Trash2, Zap } from 'lucide-react'
 import { api, type CustomSignal } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
-import { BUILTIN_SIGNAL_DEFINITIONS, type SignalKind } from '@/lib/signals'
+import { BUILTIN_SIGNAL_DEFINITIONS, isFieldRef, fieldRefName, rightConstantText, type SignalKind } from '@/lib/signals'
 import { CustomSignalDialog } from '@/components/signals/CustomSignalDialog'
 import { Skeleton } from '@/components/data/Skeleton'
 import { PageHeader } from '@/components/PageHeader'
@@ -156,9 +156,19 @@ function SignalsBody({ highlight }: { highlight: string }) {
                       <span className={`rounded px-1.5 py-0.5 text-[10px] ${KIND_CLASS[sig.kind]}`}>
                         {KIND_LABEL[sig.kind]}
                       </span>
+                      {sig.timeframe === 'intraday' && (
+                        <span
+                          className="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent"
+                          title="盘中信号：依赖分钟特征(price/vwap/pct_from_open 等)，只在盘中监控/盘中策略生效；选股与回测走日线帧，不会列出它"
+                        >
+                          盘中
+                        </span>
+                      )}
                       {!sig.enabled && <span className="rounded bg-muted/10 px-1.5 py-0.5 text-[10px] text-muted">已停用</span>}
                     </div>
-                    <p className="mt-1 truncate font-mono text-[11px] text-muted">csg_{sig.id}</p>
+                    <p className="mt-1 truncate font-mono text-[11px] text-muted">
+                      {sig.timeframe === 'intraday' ? 'csgi_' : 'csg_'}{sig.id}
+                    </p>
                   </div>
                   <div className="flex shrink-0 items-center gap-1">
                     <button onClick={() => toggleEnabled(sig)} title={sig.enabled ? '停用' : '启用'} className={`cursor-pointer rounded p-1 ${sig.enabled ? 'text-emerald-400 hover:bg-emerald-400/10' : 'text-muted hover:bg-elevated'}`}>
@@ -195,9 +205,9 @@ function SignalsBody({ highlight }: { highlight: string }) {
                       <span className="font-mono text-foreground/80">{fieldWithDays(c.left, c.leftDays, fields)}</span>
                       <span className="font-mono text-muted">{c.op}</span>
                       <span className="font-mono text-foreground/80">
-                        {c.right.startsWith('field:')
-                          ? fieldWithDays(c.right.slice(6), c.rightDays, fields)
-                          : c.right}
+                        {isFieldRef(c.right)
+                          ? fieldWithDays(fieldRefName(c.right), c.rightDays, fields)
+                          : rightConstantText(c.right)}
                       </span>
                     </div>
                   ))}

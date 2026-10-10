@@ -40,7 +40,10 @@ def _invalidate(request: Request) -> None:
 class ConditionModel(BaseModel):
     left: str        # 字段名（日线在白名单 / 盘中在特征白名单）
     op: str          # > >= < <= == != ; 盘中额外: cross_up cross_down
-    right: str       # "field:xxx" 或数字字符串
+    # 右值: "field:xxx" 或**数字常量**。历史定义与盘中信号（csg_hp_*）的
+    # JSON 里 right 直接是数字（0.03 / 2 / -0.03），编辑回传时必须同样接受
+    # 数值，否则 pydantic 报 422 string_type（实测 15 个信号里 13 个中招）。
+    right: str | float | int
     leftDays: int = 0    # 左字段取几日前 (0=当日, 默认; 盘中信号必须为 0)
     rightDays: int = 0   # 右字段取几日前 (仅 right 为字段时有意义; 盘中信号必须为 0)
 
@@ -191,7 +194,7 @@ async def ai_generate_signal(req: AIGenerateRequest):
     不落盘：只返回 {name, conditions} 供前端回填表单，由用户确认后走
     常规 save 流程。校验复用 custom_signals.validate()（白名单安全闸门）。
     """
-    from app.services.ai_provider import generate_ai_text
+    from app.services.ai_provider import generate_ai_text, role_model
     from app.strategy import custom_signals_ai
 
     description = req.description.strip()
@@ -204,7 +207,9 @@ async def ai_generate_signal(req: AIGenerateRequest):
     try:
         # max_tokens=None 不传上限: 推理模型思考 token 计入预算, 显式限制
         # 会挤占正文导致 JSON 截断/0 字 (与四个分析器同因, 见 0ee3aa8)
-        text = await generate_ai_text(messages, temperature=0.2, max_tokens=None)
+        text = await generate_ai_text(messages, temperature=0.2, max_tokens=None,
+                                      # 分组模型：「策略」组，可在 设置→AI 配置
+                                      model=role_model("strategy"))
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:

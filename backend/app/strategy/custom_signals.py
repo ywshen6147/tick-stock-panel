@@ -286,6 +286,11 @@ def build_expressions(signals: list[dict], allow_shift: bool = True) -> dict[str
     """把多个自定义信号编译成 {column_name: pl.Expr}。
 
     - 只处理 enabled != False 的信号。
+    - **只编译日线信号**（``timeframe`` 缺省或 ``daily``）：盘中信号
+      (``timeframe="intraday"``) 的字段属于**分钟特征帧**、列名走 ``csgi_``
+      前缀（见 :func:`build_intraday_expressions`），混进日线帧只会编译失败
+      （``vwap`` 不在日线白名单 / ``cross_up`` 不是日线运算符）或注入时缺依赖
+      （``pct_from_open`` 等）。在源头分流，不依赖调用方先过滤。
     - 单个信号内多条件用 ``&`` 串联（AND）。
     - allow_shift=False 时, 跳过带日期偏移 (leftDays/rightDays>0) 的信号
       (盘中单日快照上 .shift 跨 symbol 语义不正确, 优雅降级)。
@@ -295,6 +300,10 @@ def build_expressions(signals: list[dict], allow_shift: bool = True) -> dict[str
     string_fields = _string_ext_fields()
     for sig in signals:
         if sig.get("enabled") is False:
+            continue
+        # 周期分流: 盘中信号交给 build_intraday_expressions（TIMEFRAME_* 在模块
+        # 后段定义, 调用期解析, 此处可用）
+        if str(sig.get("timeframe") or TIMEFRAME_DAILY) != TIMEFRAME_DAILY:
             continue
         try:
             conds = sig["conditions"]

@@ -87,6 +87,18 @@ HAIPING_SYSTEM_PROMPT = """你是「海平分时擒牛」分时交易分析师�
      → 系统判据: `flat_low_dive == true`（状态型）
 风控纪律：纪律 > 情绪；止损 > 扛单；胜率 > 单次暴利；没有符合条件的机会就**不交易**。
 
+## 你的记忆与知识库（memory 字段，必读）
+每轮决策你都会拿到 `memory`，它是你**自己过往每日复盘**沉淀下来的东西——不是装饰，是纪律：
+- `memory.profile`   你的历史战绩（胜率/盈亏比/已实现盈亏/最大回撤/连胜连亏）与当前关注点
+  （`focus`）、已内化纪律（`disciplines`）。战绩差时要更保守：宁可漏，不可乱。
+- `memory.lessons`   你在复盘中总结的经验教训（带日期/标签/置信度）。**下单前逐条核对**：
+  若本次动作与某条"避免/禁止"类经验冲突，必须在 `reason` 里写清这次为何例外，否则不做。
+- `memory.recent_reviews` 最近几天的复盘结论（做错了什么/下一步该盯什么），优先执行
+  `next_focus`。
+- `memory.knowledge` 你的知识库条目（《海平分时擒牛》要点 + 复盘沉淀的新规则）。
+- `memory.enabled == false` 表示记忆不可用，此时**忽略本段**，纯按方法论判断。
+- **不要**把 `memory` 里的历史当成本次行情数据；它只用于约束你的行为，不能替代 `features`。
+
 ## 输入字段口径（features 里每个标的最新一根已完成分钟bar）
 - `vwap`       分时均价线（黄色均价线）—— 本体系的中心基准
 - `price`      最新价（与 quotes 一致）
@@ -543,6 +555,16 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
         if merged.get("vwap") is not None or merged.get("price") is not None:
             features[sym] = merged
 
+    # ── 记忆与知识库（每日收盘复盘沉淀，注入决策提示词 → 越做越准）──────
+    # 懒导入避免循环依赖；记忆读取失败不影响交易（降级为无记忆）。
+    try:
+        from app.strategy import paper_memory
+
+        memory = paper_memory.build_memory_context(data_dir, account_id, symbols=symbols)
+    except Exception:
+        logger.debug("memory context unavailable", exc_info=True)
+        memory = {"enabled": False, "note": "记忆读取失败（按原方法论判断）"}
+
     return {
         "time": cn_now().strftime("%Y-%m-%d %H:%M:%S"),
         "account": {"id": account_id, "cash": acc.get("cash"), "status": acc.get("status")},
@@ -550,6 +572,7 @@ def _build_context(data_dir: Path, account_id: str, acc: dict[str, Any],
         "orders_today": orders_today,
         "buy_amount_today_est": round(buy_amount_today, 2),
         "sell_amount_today_est": round(sell_amount_today, 2),
+        "memory": memory,
         "max_order_amount": _fnum(acc, "llm_max_order_amount", DEFAULT_MAX_ORDER_AMOUNT),
         "max_daily_amount": _fnum(acc, "llm_max_daily_amount", DEFAULT_MAX_DAILY_AMOUNT),
         "max_daily_sell_amount": _fnum(acc, "llm_max_daily_sell_amount", DEFAULT_MAX_DAILY_SELL_AMOUNT),
@@ -603,8 +626,12 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 
 
 # ── 单次 LLM 决策 ────────────────────────────────────────────────
-async def _decide(ctx: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
-    """调 LLM 拿决策。返回 (decision|None, raw_text)。"""
+async def _decide(ctx: dict[str, Any], *, model: str | None = None) -> tuple[dict[str, Any] | None, str]:
+    """调 LLM 拿决策。返回 (decision|None, raw_text)。
+
+    ``model``: 「海平」这一路的模型覆盖（None = 跟随全局 AI 设置）——
+    便于让海平终判与四派顾问用不同模型。
+    """
     from app.services import ai_provider
 
     if not ai_provider.ai_configured():
@@ -625,7 +652,7 @@ async def _decide(ctx: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
         #     max_tokens 预算**, 显式限制(如 800)会把正文吃光 → 返回空串,
         #     表现为"模型没输出"。交给服务端默认上限最稳。
         text = await ai_provider.generate_ai_text(
-            messages, temperature=None, max_tokens=None, timeout=180.0,
+            messages, temperature=None, max_tokens=None, timeout=180.0, model=model,
         )
     except Exception as e:  # noqa: BLE001
         return None, f"LLM 调用失败: {e}"
@@ -795,6 +822,18 @@ def _execute_price_level(data_dir: Path, account_id: str, acc: dict[str, Any],
     return rec
 
 
+def _stop_limit(acc: dict[str, Any]) -> float:
+    """硬止损阈值（小数制）: 账户可覆盖 `llm_stop_loss_pct`, 非法值回落默认。
+
+    单点口径: `_stop_backstop` 判定与「风控兜底」留痕都用它, 避免两处漂移。
+    """
+    try:
+        limit = float(acc.get("llm_stop_loss_pct") or STOP_LOSS_PCT)
+    except (TypeError, ValueError):
+        return STOP_LOSS_PCT
+    return limit if 0 < limit <= 0.5 else STOP_LOSS_PCT
+
+
 def _stop_backstop(acc: dict[str, Any], ctx: dict[str, Any], symbols: list[str],
                    down_cross: dict[str, bool]) -> dict[str, Any] | None:
     """**确定性止损兜底**（优先级：价格档位 > 本兜底 > LLM 判断）。
@@ -830,12 +869,7 @@ def _stop_backstop(acc: dict[str, Any], ctx: dict[str, Any], symbols: list[str],
         except (TypeError, ValueError):
             pct = None
         # 硬止损阈值可按账户覆盖（llm_stop_loss_pct，小数制）；非法值回落默认。
-        try:
-            _limit = float(acc.get("llm_stop_loss_pct") or STOP_LOSS_PCT)
-        except (TypeError, ValueError):
-            _limit = STOP_LOSS_PCT
-        if not (0 < _limit <= 0.5):
-            _limit = STOP_LOSS_PCT
+        _limit = _stop_limit(acc)
         reason = None
         if pct is not None and pct <= -_limit:
             reason = f"硬止损(代码兜底): 相对开盘 {pct:.2%} ≤ -{_limit:.0%}"
@@ -845,6 +879,75 @@ def _stop_backstop(acc: dict[str, Any], ctx: dict[str, Any], symbols: list[str],
             return {"action": "sell", "symbol": sym, "target": "exit", "stop": True,
                     "reason": reason, "basis": "代码兜底·硬止损/跌破均价线S点"}
     return None
+
+
+def _risk_turn_payload(ctx: dict[str, Any], stop_act: dict[str, Any],
+                       market: dict[str, Any], threshold: float) -> dict[str, Any]:
+    """构造「风控兜底」留痕的 request 快照（触发时的盘口 + 持仓 + 阈值）。
+
+    纯函数, 便于测试: 兜底路径不调用模型, 但要让用户在对话面板里看到
+    "为什么这次没问模型就直接清仓了"。
+    """
+    sym = str(stop_act.get("symbol") or "")
+    feats = (ctx.get("features") or {}).get(sym) or {}
+    pos = (ctx.get("positions") or {}).get(sym) or {}
+    return {
+        "trigger": "stop_backstop",
+        "model_called": False,
+        "symbol": sym,
+        "threshold_pct": -round(float(threshold), 4),
+        "features": {
+            "pct_from_open": feats.get("pct_from_open"),
+            "price": feats.get("price"),
+            "vwap": feats.get("vwap"),
+            "day_open": feats.get("day_open"),
+        },
+        "position": {
+            "qty": pos.get("qty"),
+            "available_qty": pos.get("available_qty"),
+            "avg_cost": pos.get("avg_cost"),
+        },
+        "market": market,
+    }
+
+
+def _record_risk_turn(data_dir: Path, account_id: str, ctx: dict[str, Any],
+                      stop_act: dict[str, Any], rec: dict[str, Any],
+                      market: dict[str, Any], threshold: float) -> None:
+    """把代码兜底止损写进对话留痕（channel=risk, 明确标注未调用模型）。
+
+    失败静默 —— 与决策留痕同纪律, 绝不影响下单。
+    """
+    try:
+        from app.strategy import paper_conversation
+
+        paper_conversation.record_turn(
+            data_dir, account_id, channel="risk",
+            request=_risk_turn_payload(ctx, stop_act, market, threshold),
+            response=str(stop_act.get("reason") or "代码兜底风控触发"),
+            parsed={
+                "action": stop_act.get("action"),
+                "symbol": stop_act.get("symbol"),
+                "target": stop_act.get("target"),
+                "stop": bool(stop_act.get("stop")),
+                "reason": stop_act.get("reason"),
+                "basis": stop_act.get("basis"),
+            },
+            meta={
+                "action": stop_act.get("action"),
+                "symbol": stop_act.get("symbol"),
+                "qty": rec.get("qty"),
+                "result": rec.get("result"),
+                "reason": stop_act.get("reason"),
+                "trigger": "stop_backstop",
+                "model_called": False,
+            },
+            elapsed_ms=0.0,
+            system_chars=0,
+            error=None,
+        )
+    except Exception:
+        logger.debug("record risk turn failed", exc_info=True)
 
 
 def _execute(data_dir: Path, account_id: str, acc: dict[str, Any], decision: dict[str, Any],
@@ -977,6 +1080,359 @@ def _execute(data_dir: Path, account_id: str, acc: dict[str, Any], decision: dic
     return rec
 
 
+def _debate_enabled(acc: dict[str, Any]) -> bool:
+    """五派辩论总开关（账户级, 缺省开）。"""
+    v = acc.get("llm_debate_enabled")
+    return True if v is None else bool(v)
+
+
+def _haiping_model(acc: dict[str, Any]) -> str:
+    """「海平」决策/终判用的模型（空 = 跟随全局 AI 设置里的模型）。"""
+    return str(acc.get("llm_model") or "").strip()
+
+
+def _debate_model(acc: dict[str, Any]) -> str:
+    """四派顾问用的模型（空 = 跟随全局 AI 设置）。
+
+    独立成项的意义: 一轮辩论 = 4 派 × 3 轮 = 12 次调用, 让四派跑轻量快模型
+    （如 doubao-seed-2.0-lite）而海平终判跑强模型, 能显著提速省钱。
+    """
+    return str(acc.get("llm_debate_model") or "").strip()
+
+
+def _debate_model_for(acc: dict[str, Any], analyst_id: str) -> str:
+    """**某一位**顾问的模型，优先级：该派单独指定 > 四派统一 > 全局。
+
+    每派一个模型的实际用途：让"轻"的派（如 K线形态识别）跑快模型、
+    "重"的派（如缠论结构推演）跑强模型 —— 12 次调用里能省下大头。
+    """
+    per = str(acc.get(f"llm_debate_model_{analyst_id}") or "").strip()
+    return per or _debate_model(acc)
+
+
+def debate_models_of(acc: dict[str, Any]) -> dict[str, str]:
+    """四派各自的生效模型（空串 = 跟随全局），供辩论引擎逐派取用。"""
+    from app.strategy.paper_personas import ANALYSTS
+
+    return {a["id"]: _debate_model_for(acc, a["id"]) for a in ANALYSTS}
+
+
+# 供 API 层（手动召集辩论）复用的公开别名
+haiping_model_of = _haiping_model
+debate_model_of = _debate_model
+
+
+def _debate_analysts() -> list[dict[str, Any]]:
+    """四派顾问名册（供 UI 展示; 提示词在 paper_personas）。"""
+    from app.strategy.paper_personas import ANALYSTS
+
+    return ANALYSTS
+
+
+def _debate_gate_threshold() -> int:
+    """风控闸门阈值: 明确反对开新仓达到该派数 → 禁止开仓。"""
+    from app.strategy.paper_debate import RISK_GATE_OPPOSE_THRESHOLD
+
+    return RISK_GATE_OPPOSE_THRESHOLD
+
+
+def _debate_rounds(acc: dict[str, Any]) -> int:
+    """辩论轮数（1~3, 缺省 3: 独立分析 → 互相修正 → 各自定论）。"""
+    try:
+        n = int(acc.get("llm_debate_rounds") or 3)
+    except (TypeError, ValueError):
+        n = 3
+    return max(1, min(n, 3))
+
+
+def _debate_daily_max(acc: dict[str, Any]) -> int:
+    """当日最多召集几次（安全网, 防止一路出手把 token 烧穿）。"""
+    try:
+        n = int(acc.get("llm_debate_daily_max") or 12)
+    except (TypeError, ValueError):
+        n = 12
+    return max(0, n)
+
+
+def debate_state(data_dir: Path, account_id: str) -> dict[str, Any]:
+    """当日辩论用量与上次结论（供 UI 显示）。"""
+    st = load_state(data_dir, account_id)
+    today = cn_today().isoformat()
+    used = int(st.get("debate_runs") or 0) if st.get("debate_day") == today else 0
+    return {
+        "day": today,
+        "runs_today": used,
+        "last_at": st.get("debate_last_at"),
+        "last_summary": st.get("debate_last_summary"),
+        "last_oppose": st.get("debate_last_oppose"),
+    }
+
+
+async def _run_debate_if_needed(
+    data_dir: Path, account_id: str, acc: dict[str, Any], ctx: dict[str, Any],
+    prelim: dict[str, Any] | None, market: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """海平**有出手意图**时才召集五派辩论, 再让海平终判。
+
+    返回 (最终decision, debate_result|None)。持有/观望的常规 tick 不召集 → 零额外成本。
+    终判失败时保守降级为 hold（宁可不动, 不在"没想清楚"时下单）。
+    """
+    if not _debate_enabled(acc):
+        return prelim, None
+    if str((prelim or {}).get("action") or "").lower() not in ("buy", "sell"):
+        return prelim, None
+
+    state = load_state(data_dir, account_id)
+    today = cn_today().isoformat()
+    used = int(state.get("debate_runs") or 0) if state.get("debate_day") == today else 0
+    cap = _debate_daily_max(acc)
+    if used >= cap:
+        logger.info("llm auto %s: 五派辩论已达当日上限 %s, 跳过", account_id, cap)
+        return prelim, {"ok": False, "skipped": "daily_max", "gate": {"allow_open": True}}
+
+    from app.strategy import paper_debate
+
+    result = await paper_debate.run_debate(
+        data_dir, account_id, ctx, market=market, intent=prelim,
+        rounds=_debate_rounds(acc), model=_debate_model(acc),
+        model_by_id=debate_models_of(acc),
+    )
+    debate = result.get("debate") or {}
+    state["debate_day"] = today
+    state["debate_runs"] = used + 1
+    state["debate_last_at"] = cn_now().isoformat(timespec="seconds")
+    state["debate_last_summary"] = debate.get("consensus")
+    state["debate_last_oppose"] = debate.get("oppose_new_position")
+    save_state(data_dir, account_id, state)
+
+    if not result.get("ok"):
+        # 四派全部弃权: 保留海平初判, 但把"辩论无结论"记进闸门上下文
+        logger.warning("llm auto %s: 五派辩论未取得任何有效结论", account_id)
+        return prelim, result
+
+    ctx2 = dict(ctx)
+    ctx2["debate"] = {
+        "summary": result.get("summary"),
+        "consensus": debate.get("consensus"),
+        "stance_count": debate.get("stance_count"),
+        "oppose_new_position": debate.get("oppose_new_position"),
+        "risk_gate": result.get("gate"),
+        "note": "四派意见仅供参考, 由你做最终裁定; 若闸门触发则本轮禁止开仓。",
+    }
+    t0 = time.perf_counter()
+    final, raw = await _decide(ctx2, model=_haiping_model(acc))
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    try:
+        from app.strategy import paper_conversation
+
+        paper_conversation.record_turn(
+            data_dir, account_id, channel="decision",
+            request=ctx2, response=raw or "", parsed=final,
+            meta={
+                "phase": "final",
+                "after_debate": True,
+                "action": (final or {}).get("action"),
+                "symbol": (final or {}).get("symbol"),
+                "qty": (final or {}).get("qty"),
+                "reason": (final or {}).get("reason"),
+                "debate_oppose": debate.get("oppose_new_position"),
+                "gate_allow_open": (result.get("gate") or {}).get("allow_open"),
+            },
+            elapsed_ms=elapsed_ms,
+            system_chars=len(HAIPING_SYSTEM_PROMPT),
+            error=None if final is not None else "未得到有效 JSON",
+        )
+    except Exception:
+        logger.debug("record final decision turn failed", exc_info=True)
+
+    if final is None:
+        return {
+            "action": "hold", "reason": "五派辩论后终判失败, 本轮不动作",
+            "_debate_final_failed": True,
+        }, result
+    return final, result
+
+
+def _record_gate_turn(data_dir: Path, account_id: str, decision: dict[str, Any],
+                      gate: dict[str, Any], debate: dict[str, Any]) -> None:
+    """风控闸门拦截"开新仓"时留痕（channel=risk），失败静默。"""
+    try:
+        from app.strategy import paper_conversation
+
+        debate_body = debate.get("debate") or {}
+        paper_conversation.record_turn(
+            data_dir, account_id, channel="risk",
+            request={
+                "trigger": "debate_risk_gate",
+                "model_called": True,
+                "blocked_decision": {
+                    k: decision.get(k) for k in ("action", "symbol", "qty", "reason")
+                },
+                "gate": gate,
+                "stance_count": debate_body.get("stance_count"),
+                "consensus": debate_body.get("consensus"),
+            },
+            response=str(gate.get("reason") or "风控闸门拦截开仓"),
+            parsed={"action": "hold", "reason": gate.get("reason"), "basis": "五派辩论风控闸门"},
+            meta={
+                "action": "hold", "symbol": decision.get("symbol"),
+                "qty": None, "result": "rejected",
+                "reason": gate.get("reason"), "trigger": "debate_risk_gate",
+                "model_called": True, "oppose_count": gate.get("oppose_count"),
+            },
+            elapsed_ms=0.0, system_chars=0, error=None,
+        )
+    except Exception:
+        logger.debug("record debate gate turn failed", exc_info=True)
+
+
+def _daily_close_before(data_dir: Path, symbols: list[str], day: str) -> dict[str, float]:
+    """``day`` **之前**最近一个日线分区的收盘价（按分区日期算, 不按自然日）。
+
+    与 `_prev_close_map` 的区别: 后者相对"日历今天"。盘后/周末手动召集时,
+    最新的日线分区可能早于今天（如今天周六, 最新交易日是昨天）——
+    此时必须相对**该分区自己的日期**取前收, 否则前后两天会取成同一天,
+    `pct_vs_prev_close` 恒等于 0。
+    """
+    import polars as pl  # noqa: PLC0415
+
+    root = Path(data_dir) / "kline_daily"
+    try:
+        dates = sorted(
+            p.name.split("=", 1)[1] for p in root.glob("date=*")
+            if p.name.split("=", 1)[1] < day
+        )
+        if not dates:
+            return {}
+        f = root / f"date={dates[-1]}" / "part.parquet"
+        if not f.exists():
+            return {}
+        df = pl.read_parquet(f, columns=["symbol", "close"])
+        df = df.filter(pl.col("symbol").cast(pl.Utf8).is_in(list(symbols)))
+    except Exception:
+        logger.debug("daily close before read failed", exc_info=True)
+        return {}
+    out: dict[str, float] = {}
+    for r in df.to_dicts():
+        try:
+            out[str(r["symbol"])] = float(r["close"])
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _latest_daily_bar(data_dir: Path, symbols: list[str]) -> dict[str, dict[str, Any]]:
+    """最新一个日线分区里这些标的的 OHLCV —— 分钟数据缺失时的**兜底事实源**。
+
+    为什么需要: 盘后（或分钟服务当天没跑）手动召集五派辩论时, 本地可能没有
+    当日分钟数据, `features` 会全空 → 四派只能回"数据不可用、无法判断",
+    辩论就白跑了。收盘后的日线分区通常已经有了; 且四派里三派（蔡森/缠论/K线）
+    本来就看日K结构, 用日线兜底是合适的最小事实集。
+    """
+    import polars as pl  # noqa: PLC0415 — 懒导入, 与本模块其它读取一致
+
+    base = Path(data_dir) / "kline_daily"
+    parts = sorted(base.glob("date=*"))
+    if not parts:
+        return {}
+    part = parts[-1] / "part.parquet"
+    if not part.exists():
+        return {}
+    try:
+        df = pl.read_parquet(part)
+        keep = [c for c in ("symbol", "open", "high", "low", "close", "volume", "amount")
+                if c in df.columns]
+        df = df.select(keep).filter(pl.col("symbol").is_in(list(symbols)))
+    except Exception:
+        logger.debug("daily bar fallback read failed", exc_info=True)
+        return {}
+    day = parts[-1].name.split("=", 1)[1]
+    out: dict[str, dict[str, Any]] = {}
+    for row in df.iter_rows(named=True):
+        out[str(row["symbol"])] = {
+            "date": day,
+            "day_open": row.get("open"), "high": row.get("high"), "low": row.get("low"),
+            "close": row.get("close"), "volume": row.get("volume"), "amount": row.get("amount"),
+        }
+    return out
+
+
+def build_manual_context(
+    data_dir: Path, account_id: str, acc: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """构建一次决策上下文（盘口/持仓/记忆）—— 手动召集五派辩论用，不下单不决策。
+
+    与 `_run_once` 同源（同一个 `_build_context` + 同一份 market 摘要），
+    保证"手动召集时四派看到的事实"与自动流程一致。差别只在**兜底**:
+    自动流程在盘中总能拿到实时快照; 手动召集可能发生在盘后, 此时用当日日线
+    的 OHLCV 补上 `price/day_open/high/low/amount`（`source="daily_close"`），
+    避免四派看到空数据只能弃权。
+    """
+    symbols = resolve_symbols(data_dir, account_id, acc)
+    ctx = _build_context(data_dir, account_id, acc, {}, symbols, quote_frame=None)
+    feats = dict(ctx.get("features") or {})
+    prev_close = _prev_close_map(data_dir, symbols)
+    bars = _latest_daily_bar(data_dir, symbols)
+
+    for sym in symbols:
+        cur = feats.get(sym) or {}
+        if cur.get("price") is not None and cur.get("vwap") is not None:
+            continue                      # 已有分钟/快照数据 → 不动
+        bar = bars.get(sym)
+        if not bar or bar.get("close") is None:
+            continue
+        px = float(bar["close"])
+        merged = dict(cur)
+        merged["price"] = px
+        if bar.get("day_open") is not None:
+            merged["day_open"] = float(bar["day_open"])
+        merged["high"] = bar.get("high")
+        merged["low"] = bar.get("low")
+        merged["amount"] = bar.get("amount")
+        merged["volume"] = bar.get("volume")
+        merged["prev_close"] = (
+            _daily_close_before(data_dir, [sym], str(bar.get("date") or "")).get(sym)
+            or prev_close.get(sym)
+            or cur.get("prev_close")
+        )
+        merged["source"] = "daily_close"
+        merged["bar_time"] = bar.get("date")
+        if merged.get("day_open"):
+            merged["pct_from_open"] = px / float(merged["day_open"]) - 1.0
+        if merged.get("prev_close"):
+            merged["pct_vs_prev_close"] = px / float(merged["prev_close"]) - 1.0
+        feats[sym] = merged
+
+    ctx["features"] = feats
+    market = {
+        s: {
+            "price": (feats.get(s) or {}).get("price"),
+            "vwap": (feats.get(s) or {}).get("vwap"),
+            "source": (feats.get(s) or {}).get("source"),
+        }
+        for s in symbols
+    }
+    if bars:
+        ctx["data_note"] = (
+            f"分钟数据不可用, 已用最新日线（{sorted({b['date'] for b in bars.values()})[0]}）"
+            "的 OHLCV 兜底; vwap 缺失, 分时类判断请降低置信度。"
+        )
+    return ctx, market
+
+
+def note_manual_debate(data_dir: Path, account_id: str, result: dict[str, Any]) -> None:
+    """手动召集后更新"上次结论"（不占自动配额计数）。失败静默。"""
+    try:
+        st = load_state(data_dir, account_id)
+        debate = result.get("debate") or {}
+        st["debate_manual_last_at"] = cn_now().isoformat(timespec="seconds")
+        st["debate_manual_summary"] = debate.get("consensus")
+        st["debate_manual_oppose"] = debate.get("oppose_new_position")
+        save_state(data_dir, account_id, st)
+    except Exception:
+        logger.debug("note manual debate failed", exc_info=True)
+
+
 async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float],
                     quote_frame: Any = None) -> dict[str, Any]:
     acc = paper.get_account(data_dir, account_id)
@@ -1031,6 +1487,9 @@ async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float],
         rec["market"] = market
         rec["trigger"] = "stop_backstop"
         _append_decision(data_dir, account_id, rec)
+        # 对话留痕 (channel=risk): 兜底路径**不调用模型**, 但盘里会多出一笔卖出 →
+        # 不留痕的话用户在有卖出、对话里查不到出处。放在 return 之前。
+        _record_risk_turn(data_dir, account_id, ctx, stop_act, rec, market, _stop_limit(acc))
         if rec.get("result") == "ordered":
             _emit_order_alert(data_dir, account_id, rec)
         logger.info("llm auto %s: stop-backstop %s result=%s qty=%s (%s)", account_id,
@@ -1038,11 +1497,56 @@ async def _run_once(data_dir: Path, account_id: str, snapshot: dict[str, float],
                     stop_act.get("reason"))
         return rec
 
-    decision, raw = await _decide(ctx)
+    _decide_t0 = time.perf_counter()
+    decision, raw = await _decide(ctx, model=_haiping_model(acc))
+    _decide_elapsed_ms = (time.perf_counter() - _decide_t0) * 1000
+    # 对话留痕: 让用户能在 UI 里看见"智能体发了什么、模型回了什么"（失败不影响交易）
+    try:
+        from app.strategy import paper_conversation
+
+        paper_conversation.record_turn(
+            data_dir, account_id, channel="decision",
+            request=ctx, response=raw or "", parsed=decision,
+            meta={
+                "action": (decision or {}).get("action"),
+                "symbol": (decision or {}).get("symbol"),
+                "qty": (decision or {}).get("qty"),
+                "reason": (decision or {}).get("reason"),
+            },
+            elapsed_ms=_decide_elapsed_ms,
+            system_chars=len(HAIPING_SYSTEM_PROMPT),
+            error=None if decision is not None else "未得到有效 JSON",
+        )
+    except Exception:
+        logger.debug("record decision turn failed", exc_info=True)
     if decision is None:
         rec = {"ts": cn_now().isoformat(timespec="seconds"), "account": account_id,
                "action": "hold", "result": "rejected",
                "error": f"未得到有效 JSON: {str(raw)[:200]}", "market": market}
+        _append_decision(data_dir, account_id, rec)
+        return rec
+
+    # ── 五派辩论（仅当海平有出手意图）+ 风控闸门 ─────────────────────
+    decision, debate_result = await _run_debate_if_needed(
+        data_dir, account_id, acc, ctx, decision, market,
+    )
+    if (
+        debate_result
+        and (debate_result.get("gate") or {}).get("allow_open") is False
+        and str((decision or {}).get("action") or "").lower() == "buy"
+    ):
+        gate = debate_result["gate"]
+        rec = {"ts": cn_now().isoformat(timespec="seconds"), "account": account_id,
+               "action": "hold", "result": "rejected", "error": gate.get("reason"),
+               "trigger": "debate_risk_gate", "market": market}
+        _append_decision(data_dir, account_id, rec)
+        _record_gate_turn(data_dir, account_id, decision, gate, debate_result)
+        logger.info("llm auto %s: 五派辩论闸门拦截开仓 (%s)", account_id, gate.get("reason"))
+        return rec
+    if decision is None:
+        rec = {"ts": cn_now().isoformat(timespec="seconds"), "account": account_id,
+               "action": "hold", "result": "rejected",
+               "error": "五派辩论后终判无有效 JSON", "market": market}
         _append_decision(data_dir, account_id, rec)
         return rec
 
@@ -1205,6 +1709,31 @@ def status(data_dir: Path, account_id: str) -> dict[str, Any]:
             "exit_all": _fnum(acc, "llm_price_exit_all", 0.0),
         },
         "symbols": resolve_symbols(data_dir, account_id, acc),
+        # 分组模型: 海平决策/终判 与 四派顾问 各用哪个（空 = 跟随全局 AI 设置）
+        "model": _haiping_model(acc),
+        "review_model": str(acc.get("llm_review_model") or "").strip(),
+        "ai_model_default": (ai_provider.current_ai_model() if ai_ok else ""),
+        "debate": {
+            "enabled": _debate_enabled(acc),
+            "rounds": _debate_rounds(acc),
+            "daily_max": _debate_daily_max(acc),
+            "model": _debate_model(acc),
+            # 四派逐派生效模型（空串 = 跟随全局）——面板可显示"哪派用哪个模型"
+            "models": debate_models_of(acc),
+            # 逐派**显式设置**的原值（空串 = 未单独设置）—— 供头部快捷编辑器回填:
+            # 编辑器必须用"已设置值"而不是"生效值", 否则保存时会把 4 条都写成显式覆盖,
+            # 破坏"留空即跟随统一值"的语义。
+            "models_set": {
+                a["id"]: str(acc.get(f"llm_debate_model_{a['id']}") or "").strip()
+                for a in _debate_analysts()
+            },
+            "analysts": [
+                {"id": a["id"], "name": a["name"], "school": a.get("school"), "view": a.get("view")}
+                for a in _debate_analysts()
+            ],
+            "gate_threshold": _debate_gate_threshold(),
+            **debate_state(data_dir, account_id),
+        },
         "state": load_state(data_dir, account_id),
     }
 

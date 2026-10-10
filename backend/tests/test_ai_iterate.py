@@ -226,7 +226,7 @@ class FakeGenerator:
 
 def _fake_tool_loop(call_log: list):
     """按调用次数返回对话: 第 1 轮 run_backtest→改进, 第 2 轮原样输出(收敛)。"""
-    async def fake(messages, tools, *, execute_tool, max_rounds, temperature, max_tokens):
+    async def fake(messages, tools, *, execute_tool, max_rounds, temperature, max_tokens, **kwargs):
         call_log.append(len(call_log) + 1)
         if len(call_log) == 1:
             return [

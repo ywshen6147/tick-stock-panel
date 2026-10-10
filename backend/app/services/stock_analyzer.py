@@ -357,7 +357,7 @@ async def analyze_stock_stream(
 
     # 5+6. 构建提示词 + 流式调用 LLM(整体 try-except,任何异常都 yield error,避免前端卡死)
     try:
-        from app.services.ai_provider import stream_ai_text
+        from app.services.ai_provider import stream_ai_text, role_model
 
         # 虚拟持仓上下文 (V3): 逐账户 (V2 多账户) 收集持有该标的的持仓注入
         # (任何异常静默跳过, 不影响分析)。
@@ -388,6 +388,8 @@ async def analyze_stock_stream(
             # 预算, 固定上限会把正文挤光(实测 4500 全被推理吃掉 → 正文 0 字)。
             max_tokens=None,
             prefer_final_answer=True,
+            # 分组模型：「分析」组，可在 设置→AI 配置
+            model=role_model("analysis"),
         ):
             got_content = True
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)

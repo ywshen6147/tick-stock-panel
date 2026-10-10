@@ -315,7 +315,7 @@ async def recap_market_stream(
 
     # 3+4. 构建 prompt + 流式调用 LLM(整体 try-except,任何异常 yield error,避免前端卡死)
     try:
-        from app.services.ai_provider import stream_ai_text
+        from app.services.ai_provider import stream_ai_text, role_model
 
         # 龙虎榜摘要 (fuyao 专有): 拉取失败/未配置 → 空串, 复盘主流程不受影响
         from app.services import dragon_tiger as dragon_tiger_svc
@@ -337,6 +337,8 @@ async def recap_market_stream(
             # 不限制输出(推理模型思考 token 计入预算, 见 ai_provider.stream_ai_text)
             max_tokens=None,
             prefer_final_answer=True,
+            # 分组模型：「分析」组，可在 设置→AI 配置
+            model=role_model("analysis"),
         ):
             got_content = True
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)

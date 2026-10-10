@@ -146,6 +146,68 @@ def test_validate_intraday_accepts_and_rejects():
         custom_signals.validate(_intraday_sig(timeframe="weekly"))
 
 
+def _daily_probe(**overrides) -> dict:
+    sig = {
+        "id": "test_daily", "name": "日线探针", "kind": "entry",
+        "timeframe": "daily",
+        "conditions": [{"left": "close", "op": ">", "right": "field:ma5"}],
+    }
+    sig.update(overrides)
+    return sig
+
+
+def test_build_expressions_skips_intraday_signals():
+    """日线编译必须跳过盘中信号。
+
+    回归: 15 个「海平盘中信号」曾被日线路径误编译 —— 每轮日线计算刷 9 条
+    compile failed（vwap / cross_up 不在日线白名单）+ 6 条 missing dependencies
+    （pct_from_open 等），累计 700+ 条警告/天，且这些列在日线帧里永远不存在。
+    """
+    assert set(custom_signals.build_expressions([_intraday_sig(), _daily_probe()])) == {"csg_test_daily"}
+    # today 热路径（allow_shift=False）同样只取日线
+    assert set(custom_signals.build_expressions([_intraday_sig(), _daily_probe()], allow_shift=False)) == {"csg_test_daily"}
+    # 缺 timeframe 的历史定义按日线处理（向后兼容）
+    legacy = {"id": "legacy", "name": "旧定义", "kind": "entry",
+              "conditions": [{"left": "close", "op": ">", "right": "1"}]}
+    assert set(custom_signals.build_expressions([legacy])) == {"csg_legacy"}
+    # 全是盘中信号（用户库现状）→ 日线侧结果为空，且不产生任何编译告警
+    assert custom_signals.build_expressions([_intraday_sig(), _intraday_sig(id="x2")]) == {}
+
+
+def test_intraday_builder_only_takes_intraday():
+    """反向分流: 盘中编译只取盘中信号，日线信号不得混入 csgi_ 列。"""
+    out = custom_signals.build_intraday_expressions([_intraday_sig(), _daily_probe()])
+    assert set(out) == {"csgi_test_sig"}
+
+
+def test_condition_model_accepts_numeric_right():
+    """回归: 盘中信号定义里 right 常是**数字**（0.03 / 2 / -0.03）。
+
+    API 模型曾把 right 声明为 str → 编辑这类信号回传时 pydantic 报
+    422 string_type（15 个海平盘中信号里 13 个中招）。右值必须同时接受字符串
+    字段引用与数值常量。
+    """
+    from app.api.signals import ConditionModel, SignalModel
+
+    m = SignalModel(
+        id="probe", name="探针", kind="entry", timeframe="intraday",
+        conditions=[
+            {"left": "pct_from_open", "op": ">=", "right": 0.03},
+            {"left": "vol_ratio_3m_today", "op": ">=", "right": 2},
+            {"left": "price", "op": "cross_up", "right": "field:vwap"},
+        ],
+    )
+    assert [c.right for c in m.conditions] == [0.03, 2, "field:vwap"]
+    # model_dump 保留原类型（落盘 JSON 与既有定义同形）
+    dumped = m.model_dump()
+    assert dumped["conditions"][0]["right"] == 0.03
+    # validate 对数字右值同样放行
+    custom_signals.validate(dumped)
+    # 单条件模型也可直接构造（前端条件行）
+    c = ConditionModel(left="close", op=">", right=0)
+    assert c.right == 0
+
+
 def test_build_intraday_expressions_edge_semantics():
     # 价格下探再上穿 vwap: 上升沿恰好只在上穿那根 bar 为 true
     prices = [10.0, 10.0, 10.0, 10.0, 9.8, 9.7, 9.6, 9.6, 9.6, 10.0, 10.2, 10.3]

@@ -97,6 +97,10 @@ def get_settings() -> dict:
         "ai_max_output_tokens": current_ai_max_output_tokens(),
         "ai_context_window": current_ai_context_window(),
         "ai_round_checkpoint": current_ai_round_checkpoint(),
+        # 分组模型（空串 = 跟随 ai_model）
+        "ai_model_chat": secrets_store.get_ai_config("ai_model_chat", settings.ai_model_chat),
+        "ai_model_analysis": secrets_store.get_ai_config("ai_model_analysis", settings.ai_model_analysis),
+        "ai_model_strategy": secrets_store.get_ai_config("ai_model_strategy", settings.ai_model_strategy),
     }
 
 
@@ -260,6 +264,10 @@ class AiSettingsIn(BaseModel):
     max_output_tokens: int | None = None   # 输出上限, 钳制所有任务的 max_tokens
     context_window: int | None = None      # 输入上下文窗口上限 (约 token)
     round_checkpoint: int | None = None    # 助手工具轮次检查点; 0=不检查
+    # ── 分组模型 (空 = 跟随全局 model) ──
+    model_chat: str | None = None          # 对话/问答 (含模拟盘「我的提问」)
+    model_analysis: str | None = None      # 概念轮动/行业/大盘复盘/个股/财务 分析
+    model_strategy: str | None = None      # AI 选股/策略生成/迭代
 
 
 @router.post("/ai")
@@ -336,6 +344,21 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
             raise HTTPException(status_code=400, detail="轮次检查点须为 0(不检查)或不小于 5 的整数")
         updates["ai_round_checkpoint"] = req.round_checkpoint
         settings.ai_round_checkpoint = req.round_checkpoint
+
+    # 分组模型: 对话 / 分析 / 策略 各用哪个模型（空串 = 清空 → 跟随全局 ai_model）
+    for field_name, attr in (
+        ("model_chat", "ai_model_chat"),
+        ("model_analysis", "ai_model_analysis"),
+        ("model_strategy", "ai_model_strategy"),
+    ):
+        value = getattr(req, field_name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if len(text) > 200:
+            raise HTTPException(status_code=400, detail=f"{field_name} 过长（模型名应 ≤200 字符）")
+        updates[attr] = text
+        setattr(settings, attr, text)
 
     if updates:
         secrets_store.save(updates)

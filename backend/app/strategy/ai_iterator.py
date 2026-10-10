@@ -15,7 +15,7 @@ from pprint import pformat
 from typing import Any
 
 from app.services import tool_catalog
-from app.services.ai_provider import generate_ai_text_with_tools
+from app.services.ai_provider import generate_ai_text_with_tools, role_model
 from app.strategy.ai_generator import AIStrategyGenerator, _SYSTEM_PREFIX, find_meta_assignment
 
 # 每轮 (生成/诊断/修改一次) 内部的工具调用预算: 至少 2 次 LLM 调用
@@ -87,6 +87,8 @@ class AIStrategyIterator:
                 max_rounds=_CYCLE_TOOL_BUDGET,
                 temperature=0.3,
                 max_tokens=None,
+                # 分组模型：「策略」组，可在 设置→AI 配置
+                model=role_model("strategy"),
             )
             # stats 是本轮「改动前」的 current_code 回测基准 (LLM 先回测再产出改进版)
             stats = _extract_backtest_stats(full)
