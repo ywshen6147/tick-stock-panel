@@ -102,6 +102,35 @@ def _fnum(v: Any) -> float | None:
         return None
 
 
+def _sane_cum_volume(sym: str, hhmm: str, cum_v: float | None,
+                     cum_a: float | None, price: float) -> float | None:
+    """落盘前的累计成交量量纲守卫(防上游口径不一污染分钟序列)。
+
+    背景: 上游成交量口径不统一 —— 腾讯接口对 688 开头(科创板)返回「股」、
+    其余返回「手」, 新浪恒为「股」。若「股」口径从某一条路径漏进来, 该分钟累计
+    量会突然放大 100 倍, 派生出的 vwap 缩小 100 倍、vol_rel_5m 变负, 直接误导
+    LLM 决策(2026-10-13 688553 实例)。
+
+    判定依据: 累计成交额(元) ÷ 现价(元) ≈ 累计股数。
+      · cum_v 与股数同阶        → 是「股」口径 → ÷100 折成「手」;
+      · cum_v ≈ 股数 / 100      → 已是「手」, 原样返回(对正确数据零副作用);
+      · 缺成交额 / 停牌无成交   → 无法判定, 原样返回。
+    """
+    if cum_v is None or cum_v <= 0:
+        return cum_v
+    if not (cum_a and cum_a > 0 and price and price > 0):
+        return cum_v
+    shares = cum_a / price
+    if shares > 0 and (cum_v / shares) > 0.1:
+        corrected = cum_v / 100.0
+        logger.warning(
+            "intraday_history 量纲守卫: %s@%s 累计量疑似「股」口径(%s), 已折算为「手」(%.2f)",
+            sym, hhmm, cum_v, corrected,
+        )
+        return corrected
+    return cum_v
+
+
 # ── 记录 ────────────────────────────────────────────────────────
 def record(data_dir: Path, frame: Any, symbols: list[str], now: datetime | None = None) -> int:
     """把本 tick 的快照关键字段按分钟记入历史。返回写入的标的数。
@@ -152,9 +181,11 @@ def record(data_dir: Path, frame: Any, symbols: list[str], now: datetime | None 
                     price = _fnum(r.get("close"))
                 if price is None or price <= 0:
                     continue
+                cum_v = _sane_cum_volume(sym, hhmm, _fnum(r.get("volume")),
+                                         _fnum(r.get("amount")), price)
                 syms.setdefault(sym, {}).setdefault("m", {})[hhmm] = {
                     "p": round(price, 4),
-                    "v": _fnum(r.get("volume")),
+                    "v": cum_v,
                     "a": _fnum(r.get("amount")),
                     "h": _fnum(r.get("raw_high")),
                     "l": _fnum(r.get("raw_low")),
@@ -195,12 +226,25 @@ def available_days(data_dir: Path) -> list[str]:
 
 # ── 派生 ────────────────────────────────────────────────────────
 def _per_minute(minutes: dict[str, dict[str, Any]], order: list[str],
-                day_open: float | None) -> list[dict[str, Any]]:
+                day_open: float | None, sym: str = "") -> list[dict[str, Any]]:
     """逐分钟算出判定所需的量（用于取"最后一分钟"与"上一分钟"做边沿比较）。
 
     每分钟产出: price / vwap / cum_vol / delta / rel5 / pct_from_open /
                 day_high(截至该分钟的运行最高) / day_low / o30h / o30l
+
+    副作用: 读取前会对 ``minutes`` 做一次**原地量纲修缮**（见 `_sane_cum_volume`），
+    使历史遗留的「股」口径脏点（如 2026-10-13 688553）在派生阶段即被纠正。
     """
+    # 读取侧量纲修缮: 对每分钟累计量做「股/手」自校验(幂等), 修正历史脏点。
+    for _hh, _c in (minutes or {}).items():
+        if not isinstance(_c, dict):
+            continue
+        _v = _fnum(_c.get("v"))
+        if _v is None:
+            continue
+        _fixed = _sane_cum_volume(sym, _hh, _v, _fnum(_c.get("a")), _fnum(_c.get("p")))
+        if _fixed is not None and _fixed != _v:
+            _c["v"] = _fixed
     rows: list[dict[str, Any]] = []
     # 上午每根 bar 的累计高/低, 用于开盘30分钟高低 (第 30 根定版)
     am = [hh for hh in order if _session_of(hh) == 0]
@@ -230,6 +274,14 @@ def _per_minute(minutes: dict[str, dict[str, Any]], order: list[str],
         if l is not None:
             run_low = l if run_low is None else min(run_low, l)
         vwap = (cum_a / (cum_v * 100.0)) if (cum_v and cum_a and cum_v > 0) else None
+        # 均价线合理性: 均价线与现价正常应贴近(日内偏离一般 <20%)。若相差
+        # 2 倍以上, 只可能来自脏数据(如量纲差 100 倍) → 判为不可用, 不喂给 LLM。
+        if vwap is not None and price and price > 0 and (vwap > price * 2.0 or vwap < price * 0.5):
+            logger.warning(
+                "intraday_history vwap 偏离现价过大, 判为不可用: %s@%s price=%s vwap=%s",
+                sym, hh, price, round(vwap, 4),
+            )
+            vwap = None
         rows.append({
             "hh": hh, "price": price, "vwap": vwap, "cum_vol": cum_v, "delta": delta,
             "day_high": run_high, "day_low": run_low, "o30h": o30h, "o30l": o30l,
@@ -288,7 +340,7 @@ def derive(data_dir: Path, symbols: list[str], day_open: dict[str, float] | None
         for hh in order:
             by_session[_session_of(hh)].append(hh)
 
-        rows = _per_minute(minutes, order, _fnum(days.get(sym)))
+        rows = _per_minute(minutes, order, _fnum(days.get(sym)), sym)
         cur = rows[-1]
         prev = rows[-2] if len(rows) >= 2 else None
 
@@ -437,7 +489,7 @@ def crossed_below_vwap(data_dir: Path, symbols: list[str],
         order = sorted(minutes.keys())
         if len(order) < 2:
             continue
-        rows = _per_minute(minutes, order, None)
+        rows = _per_minute(minutes, order, None, sym)
         cur, prev = rows[-1], rows[-2]
         px, vw = cur.get("price"), cur.get("vwap")
         ppx, pvw = prev.get("price"), prev.get("vwap")
@@ -464,7 +516,7 @@ def daily_pattern_events(data_dir: Path, day: str, symbols: list[str],
             continue
         order = sorted(minutes.keys())
         do = _fnum(days.get(sym)) or _fnum((minutes[order[0]] or {}).get("p"))
-        rows = _per_minute(minutes, order, do)
+        rows = _per_minute(minutes, order, do, sym)
         for name, idxs in pattern_edges(rows).items():
             out[name].extend(rows[i]["hh"] for i in idxs)
     for name in out:

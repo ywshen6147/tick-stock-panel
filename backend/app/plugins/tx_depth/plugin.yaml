@@ -1,0 +1,13 @@
+# 数据来源: 腾讯行情 qt.gtimg.cn (免鉴权、免注册)。
+#          单请求可批量取数十只标的的五档买卖盘, 覆盖沪深北全市场。
+#          休市时返回上一交易日收盘定格盘口 —— 「真封板」判定(涨停价卖一==0 /
+#          跌停价买一==0)以收盘定格值为准, 与盘后定版语义一致。
+name: tx_depth
+display_name: "腾讯五档盘口"
+runtime: none
+entry: app.plugins.tx_depth.provider:TxDepthProvider
+check: app.plugins.tx_depth.provider:availability
+datasets: [depth5]
+description: "腾讯行情五档买卖盘(免 Key, 零鉴权)。覆盖沪深北全市场, 单请求批量 60 只, 供连板梯队真/假封板判定与封单量(手)/封单额(元)展示。只声明 depth5 数据集 —— 日K/除权/实时/分钟/全量分时/财务的路由一概不动。"
+install_hint: "无需安装依赖, 也无需 API Key — 重载数据源后即可在下方切换五档盘口数据源。"
+homepage: "https://gu.qq.com/"

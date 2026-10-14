@@ -1,0 +1,19 @@
+# em_financial — 东方财富 F10 财务数据插件(免 Key, 纯 HTTP)
+#
+# 只声明 financial 一个数据集: 日K / 除权因子 / 实时行情 / 分钟K / 全量分钟 /
+# 五档盘口 全部保持原有路由不变, 本次接入不影响任何其他数据集。
+#
+# 数据来源: 东财数据中心 F10 财报接口 (datacenter.eastmoney.com), 零鉴权、
+#          无需注册。覆盖 沪深北 全市场 5500+ 只股票, 报告期回溯不限。
+#          三大报表 + 主要指标 走 RPT_F10_FINANCE_*, 历史股本另走股本变动
+#          历史端点 RPT_F10_EH_EQUITY(事件驱动)。
+
+name: em_financial
+display_name: "东财F10财务"
+runtime: none
+entry: app.plugins.em_financial.provider:EmFinancialProvider
+check: app.plugins.em_financial.provider:availability
+datasets: [financial]
+description: "东方财富 F10 财报(免 Key, 零鉴权)。利润表 / 资产负债表 / 现金流量表 / 主要指标(ROE·毛利率·净利率·资产负债率·同比等) + 历史股本, 覆盖沪深北全市场。股票行情类数据集(日K/分钟/实时/除权/五档)不受影响, 保持原有数据源。财务报表按『标的批次 × 报告期』批量取数(单批最多约 500 行); 历史股本按股本变动事件取数, 保留 2018 年至今, 可支撑回测的 point-in-time 流通股本还原。"
+install_hint: "无需安装依赖, 也无需 API Key — 保存后即可在下方切换为财务数据源。"
+homepage: "https://data.eastmoney.com/"

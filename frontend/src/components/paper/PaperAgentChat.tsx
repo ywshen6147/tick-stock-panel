@@ -554,7 +554,13 @@ export function PaperAgentChat({ acc }: { acc: string }) {
             </span>
             <div className="ml-auto flex items-center gap-1">
               <button
-                onClick={() => { const empty = { caishen: '', chanlun: '', canslim: '', kxian: '' }; setDraftModels(empty); modelsM.mutate(empty) }}
+                onClick={() => {
+                  // 加了确认: 这个按钮会**立即**把四派模型全清成"跟随统一", 误点一次就丢配置
+                  if (!confirm('清空四派各自的模型设置，全部改为跟随「四派统一」？')) return
+                  const empty = { caishen: '', chanlun: '', canslim: '', kxian: '' }
+                  setDraftModels(empty)
+                  modelsM.mutate(empty)
+                }}
                 className="rounded-btn border border-border px-2 py-0.5 text-[10px] text-muted transition-colors hover:text-secondary"
               >
                 全部清空（跟随统一）

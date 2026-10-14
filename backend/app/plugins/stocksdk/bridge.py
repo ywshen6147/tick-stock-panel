@@ -29,6 +29,23 @@ class StockSDKBridgeError(RuntimeError):
     """桥接调用失败(node 缺失 / stock-sdk 未安装 / 子进程异常 / 结果非法)。"""
 
 
+def _log_bridge_stderr(op: str | None, stderr: str | None) -> None:
+    """把桥接子进程的 stderr 转成日志(capture_output 会把它吞掉)。
+
+    成功返回时 stderr 里通常承载**降级/回退告警** —— 例如「新浪全市场失败 →
+    回退 sdk.batch.cn」、「分钟K 已用新浪兜底」。这些是排障的关键线索: 数据源
+    一旦被静默替换, 口径/时效可能与预期不同(2026-10-13 的量纲事故即由回退路径
+    引入且当时无任何日志可见)。故此处逐行 warn, 不再丢弃。
+    """
+    text = (stderr or "").strip()
+    if not text:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            logger.warning("stock-sdk 桥接告警 (op=%s): %s", op, line)
+
+
 def _node_bin() -> str | None:
     """定位 node 可执行文件: 优先环境变量 STOCK_SDK_NODE, 否则 PATH 中的 node。"""
     env = os.getenv("STOCK_SDK_NODE")
@@ -73,6 +90,9 @@ def run_job(job: dict, timeout: int = DEFAULT_TIMEOUT) -> dict:
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip()[-800:]
         raise StockSDKBridgeError(f"stock-sdk 桥接非零退出({proc.returncode}): {tail}")
+
+    # 成功路径也透传 stderr 中的降级/回退告警(见 _log_bridge_stderr)。
+    _log_bridge_stderr(op, proc.stderr)
 
     out = (proc.stdout or "").strip()
     if not out:

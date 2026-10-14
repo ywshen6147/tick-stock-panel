@@ -50,6 +50,60 @@ def _f(v):
         return None
 
 
+def _is_index_symbol(symbol: str | None) -> bool:
+    """app 符号是否指数。
+
+    只有两个组合被指数占用、A 股股票不会使用:
+      .SH + 000xxx (上证/中证系列: 000001 上证指数、000300 沪深300、000680 科创综指 …)
+      .SZ + 399xxx (深证系列: 399001 深证成指、399006 创业板指 …)
+    必须带后缀判断 —— 000001.SZ 是「平安银行」股票, 000001.SH 才是上证指数。
+    """
+    s = str(symbol or "")
+    dot = s.rfind(".")
+    if dot == -1:
+        return False
+    code, suffix = s[:dot], s[dot + 1:].upper()
+    if suffix == "SH":
+        return len(code) == 6 and code.startswith("000") and code.isdigit()
+    if suffix == "SZ":
+        return len(code) == 6 and code.startswith("399") and code.isdigit()
+    return False
+
+
+def _normalize_volume_to_hands(item: dict) -> None:
+    """把实时快照行的成交量统一到「手」(内部契约), 原地修改 item。
+
+    上游成交量口径**不统一**（2026-10-13 实测）: 腾讯接口对 688 开头(科创板)
+    返回「股」、其余返回「手」; 新浪出口恒为「股」。
+    bridge 侧已按此归一化, 这里再做一次**幂等**收口 —— 用「成交额 ÷ 现价 ≈ 股数」
+    自校验: 若 volume 与股数同阶 → 是「股」→ ÷100; 若约为股数的 1/100 → 已是「手」。
+
+    幂等性: 已折算过的 volume 再次进入时 ratio≈0.01, 不会再被除, 故可安全重复调用。
+    未归一化会让 vwap = amount/(volume×100) 缩小 100 倍、vol_rel_5m 变负,
+    并污染 intraday_history 的分钟序列, 最终误导 LLM 决策。
+
+    指数豁免: 指数的"价格"是点数, 成交额/点数 无股数含义, 自校验会得到随机比值
+    (实测 000001.SH/399001.SZ/000680.SH 分别为 2.36/7.74/0.31)并误除 100 倍,
+    故直接跳过。指数走 get_realtime_indices 专用路径。
+    """
+    if _is_index_symbol(item.get("symbol")):
+        return
+    vol = _f(item.get("volume"))
+    if vol is None or vol <= 0:
+        return
+    amt = _f(item.get("amount"))          # 已在调用方归一化为「元」
+    price = _f(item.get("last_price"))
+    if not (amt and amt > 0 and price and price > 0):
+        return
+    shares = amt / price                  # 由成交额/现价反推的股数
+    if shares > 0 and (vol / shares) > 0.1:
+        item["volume"] = vol / 100.0
+        logger.warning(
+            "realtime 成交量口径异常(疑似按「股」上报), 已折算为「手」: %s volume=%s ≈ %.0f 股",
+            item.get("symbol"), vol, shares,
+        )
+
+
 def _sina_get_with_retry(url: str, headers: dict, retries: int = 3) -> httpx.Response:
     """带短退避重试的新浪 GET(网络抖动/SSL 握手偶发超时用)。"""
     last: Exception | None = None
@@ -390,6 +444,8 @@ class StockSDKProvider:
             # stock-sdk 全量实时行情的 amount 单位为万元;内部日K统一使用元。
             if item.get("amount") is not None:
                 item["amount"] = float(item["amount"]) * 10_000
+            # 成交量口径收口(幂等): 上游腾讯对新股/科创板等口径不一, 统一折成「手」。
+            _normalize_volume_to_hands(item)
             normalized.append(item)
         return normalized
 
@@ -409,6 +465,7 @@ class StockSDKProvider:
 
         返回与 get_realtime 同构的行(含 symbol), 便于 _process_full_market_records
         按 symbol 识别为指数。新浪返回格式: 名称,现价,涨跌额,涨跌幅%,成交量,成交额。
+        成交量已折成「手」、成交额折成「元」, 与 get_realtime 同一契约。
         """
         if not symbols:
             symbols = list(self._SINA_INDEX_MAP.keys())
@@ -441,6 +498,19 @@ class StockSDKProvider:
                 continue
             try:
                 pct = _f(fields[3])
+                # 量纲收口 —— 新浪 s_ 接口 [4]成交量 的单位**按交易所不同**:
+                #   沪市指数 = 万股(= 手/100), 深市指数 = 手; [5]成交额则统一是 万元。
+                # 内部契约是 volume=手、amount=元(与自家 kline_index_daily 一致)。
+                # 实测 2026-10-13 跨沪深 14 只指数(上证/上证50/沪深300/科创综指/科创50/
+                # 中证500 与 深证成指/中小100/创业板50/深证综指…)交叉验证: 沪 6/6 为
+                # 万股、深 7/8 为手, 且腾讯同刻与自家指数日K 均为「手」可作基准。
+                # 不折算会让沪市指数成交量小 100 倍、所有指数成交额小 10000 倍。
+                vol = _f(fields[4])
+                if vol is not None:
+                    vol = vol * 100 if _exch.lower() == "sh" else vol
+                amt = _f(fields[5])
+                if amt is not None:
+                    amt = amt * 10_000  # 万元 → 元
                 rows.append({
                     "symbol": app_symbol,
                     "name": fields[0].strip(),
@@ -449,8 +519,8 @@ class StockSDKProvider:
                     "open": None,
                     "high": None,
                     "low": None,
-                    "volume": _f(fields[4]),
-                    "amount": _f(fields[5]),
+                    "volume": vol,
+                    "amount": amt,
                     "change_pct": (pct / 100) if pct is not None else None,  # 百分数→小数制
                     "timestamp": int(time.time() * 1000),
                 })

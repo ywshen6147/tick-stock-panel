@@ -409,11 +409,19 @@ def run_now(
         def _adj_chunk_progress(cur: int, tot: int) -> None:
             emit("sync_adj", 50 + int(10 * cur / tot),
                  f"除权因子批次 {cur}/{tot}", stage_pct=int(100 * cur / tot), skip_log=True)
-        written_adj, affected_symbols = kline_sync.sync_adj_factor(
-            universe, repo, capset,
-            start_time=adj_start, end_time=adj_end,
-            on_chunk_done=_adj_chunk_progress,
-        )
+        try:
+            written_adj, affected_symbols = kline_sync.sync_adj_factor(
+                universe, repo, capset,
+                start_time=adj_start, end_time=adj_end,
+                on_chunk_done=_adj_chunk_progress,
+            )
+        except ValueError as e:
+            # 垃圾闸拒收 (疑似每日快照/垃圾因子): 降级为无复权继续,
+            # 不让整条盘后管道失败 —— 与 _merge_adj_factor_store
+            # "宁可本轮无复权也不吃垃圾" 的设计语义一致。
+            logger.error("sync_adj: 因子同步被垃圾闸拒收, 本轮降级为无复权继续: %s", e)
+            emit("sync_adj", 60, "除权因子被拒收(疑似垃圾数据), 本轮无复权")
+            written_adj, affected_symbols = 0, []
         if affected_symbols:
             _refresh_single_view(repo, "adj_factor")
             emit("sync_adj", 60, f"除权因子完成,新增 {len(affected_symbols)} 只个股")

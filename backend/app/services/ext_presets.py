@@ -26,6 +26,9 @@ from app.services.ext_data import (
     PullConfig,
     rows_to_parquet,
 )
+# 信息面 7 层预设 (研报/新闻/公告/期权/舆情/宏观/可转债) 的工厂与拉取实现。
+# 拆到独立模块避免本文件膨胀; 与概念/行业共用同一套语义 (启动只建配置、手动拉取)。
+from app.services.ext_presets_info import info_fetcher, info_presets
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +103,9 @@ def _industry_preset() -> ExtConfig:
 
 
 def _presets() -> list[ExtConfig]:
-    return [_concept_preset(), _industry_preset()]
+    # 信息面 7 层预设 (研报/新闻/公告/期权/舆情/宏观/可转债) 在 ext_presets_info 中定义,
+    # 与概念/行业共用同一套「启动只建配置、手动拉取」的语义。
+    return [_concept_preset(), _industry_preset(), *info_presets()]
 
 
 # ---------------------------------------------------------------------------
@@ -269,13 +274,18 @@ async def fetch_preset(config_id: str, data_dir: Path) -> int:
     if config is None:
         raise ValueError(f"未知的内置预设: {config_id}")
 
-    flatten = _flatten_concept_rows if config_id == "ext_gn_ths" else _flatten_industry_rows
-
     # 确保 config.json 存在 (用户可能从未启动过 ensure_builtin_presets)
     store = ExtConfigStore(data_dir)
     if store.get(config_id) is None:
         store.upsert(config)
 
-    n = await _seed_one(config, flatten, data_dir)
+    # 信息面预设各有自己的拉取实现 (多源 / POST / HTML 解析); 概念/行业走原 JSON 展平路径。
+    info_fn = info_fetcher(config_id)
+    if info_fn is not None:
+        n = await info_fn(config, data_dir)
+    else:
+        flatten = (_flatten_concept_rows if config_id == "ext_gn_ths"
+                   else _flatten_industry_rows)
+        n = await _seed_one(config, flatten, data_dir)
     logger.info("内置扩展表 %s 手动拉取成功: %d 行", config_id, n)
     return n

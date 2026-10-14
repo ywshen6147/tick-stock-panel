@@ -1654,9 +1654,17 @@ async def rebuild_enriched(request: Request):
                              f"计算指标 批次 {cur}/{tot}",
                              stage_pct=int(100 * cur / tot), skip_log=True)
 
+                def _run_rebuild() -> int:
+                    try:
+                        return run_pipeline(on_batch_done=_batch_progress)
+                    finally:
+                        # 全量重算改写了全部日期分区, 必须同步刷新 repo 内存 enriched
+                        # 缓存 (_enriched_history_cache 等), 否则 API 继续吐进程启动时
+                        # 构建的旧缓存 —— "磁盘已修好、接口仍旧数据" 陷阱 (2026-10-14)。
+                        repo.refresh_cache()
+
                 written = await loop.run_in_executor(
-                    _long_task_executor, run_with_capacity, job_id,
-                    lambda: run_pipeline(on_batch_done=_batch_progress),
+                    _long_task_executor, run_with_capacity, job_id, _run_rebuild,
                 )
 
                 enriched_dir = repo.store.data_dir / "kline_daily_enriched"

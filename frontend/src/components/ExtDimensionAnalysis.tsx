@@ -1,4 +1,4 @@
-import { useMemo, useState, type ComponentType } from 'react'
+import { useEffect, useMemo, useState, type ComponentType } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   BarChart3,
@@ -163,15 +163,34 @@ export function ExtDimensionAnalysis({
   })
   const menu = menuQuery.data
 
-  const [selectedConfigId, setSelectedConfigId] = useState('')
   const [dimensionField, setDimensionField] = useState('')
   const [search, setSearch] = useState('')
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null)
+  // 列头点击排序 (覆盖菜单 default_sort); 「分类」选择的分组字段 (table 模式进入分组榜单)。
+  const [userSort, setUserSort] = useState<{ field: string; order: 'asc' | 'desc' } | null>(null)
+  const [groupBy, setGroupBy] = useState('')
+
+  // 切换页面 (menuId 变化) 时重置本地选择, 避免上一页的选择残留到新菜单。
+  useEffect(() => {
+    setDimensionField('')
+    setSelectedGroup(null)
+    setSearch('')
+    setUserSort(null)
+    setGroupBy('')
+  }, [menuId])
 
   const availableConfigs = configs.data?.items ?? []
-  const activeConfigId = menu?.data_source || selectedConfigId || pickDefaultConfig(availableConfigs, keywords)
+  // 数据源由菜单/左侧导航决定 — 不再提供右上角切换器:
+  // 每个信息面在侧栏都是独立入口, 切源会造成标题/列配置与实际表不一致的困惑。
+  const isTableMode = menu?.template === 'table' || menu?.template === 'ranking'
+  const activeConfigId = menu?.data_source || pickDefaultConfig(availableConfigs, keywords)
   const activeConfig = availableConfigs.find(c => c.id === activeConfigId)
   const activeDimensionField = menu?.dimension_field || dimensionField || pickDefaultDimensionField(activeConfig, fallbackFieldNames)
+  // 分组字段: 分组模板页沿用菜单维度字段; table/ranking 页由明细列表的「分类」选择器决定 (默认不分组)。
+  const activeGroupField = isTableMode
+    ? groupBy
+    : (menu?.dimension_field || dimensionField || pickDefaultDimensionField(activeConfig, fallbackFieldNames))
+  const effectiveSort = userSort ?? menu?.default_sort ?? null
   const activeTitle = menu?.label || title || '扩展分析'
   const activeKindLabel = menu?.template === 'table' ? '数据' : kindLabel
 
@@ -181,8 +200,11 @@ export function ExtDimensionAnalysis({
   }, [menu?.detail_columns])
   const requestedColumns = useMemo(() => {
     const cols = [activeDimensionField, ...(configuredColumns?.map(c => c.field) ?? [])].filter(Boolean)
-    return Array.from(new Set(cols))
-  }, [activeDimensionField, configuredColumns])
+    if (configuredColumns) return Array.from(new Set(cols))
+    // 自动列模式 (菜单未配 detail_columns 的无菜单页): 声明字段全量请求,
+    // 否则 rows 只有 symbol/code/name/维度字段, 自动列拿不到数据全渲染 "—"。
+    return Array.from(new Set([...cols, ...(activeConfig?.fields.map(f => f.name) ?? [])]))
+  }, [activeDimensionField, configuredColumns, activeConfig])
   const columnsKey = requestedColumns.join(',')
 
   const rowsQuery = useQuery({
@@ -197,28 +219,55 @@ export function ExtDimensionAnalysis({
     ? [...baseFields, { name: 'name', dtype: 'string', label: '名称' }]
     : baseFields
   const dimensionOptions = fields.filter(f => f.name !== 'symbol' && f.name !== 'code')
-  const displayColumns = configuredColumns ?? columnsFromFields(fields, activeDimensionField, rows)
+  const displayColumns = useMemo(() => {
+    const auto = columnsFromFields(fields, activeDimensionField, rows)
+    if (configuredColumns) return configuredColumns
+    // 自动列只保留数据里真实存在的字段 (声明了但后端裁剪/落盘缺失的不显示 "—" 幽灵列)
+    const probe = rows[0]
+    return rows.length === 0 || !probe
+      ? auto
+      : auto.filter(c => ['symbol', 'code', 'name'].includes(c.field) || Object.prototype.hasOwnProperty.call(probe, c.field))
+  }, [configuredColumns, fields, activeDimensionField, rows])
   const groupColumns = (menu?.group_columns?.length ? menu.group_columns : [
     { field: '__dimension', label: activeKindLabel },
-    { field: '__count', label: '股票数', type: 'number' as const, sortable: true },
+    { field: '__count', label: '数量', type: 'number' as const, sortable: true },
   ]).filter(c => c.visible !== false)
 
   const sortedRows = useMemo(() => {
-    if (!menu?.default_sort?.field) return rows
-    const factor = menu.default_sort.order === 'asc' ? 1 : -1
+    if (!effectiveSort?.field) return rows
+    const factor = effectiveSort.order === 'asc' ? 1 : -1
     return [...rows].sort((a, b) => {
-      const av = a[menu.default_sort!.field]
-      const bv = b[menu.default_sort!.field]
+      const av = a[effectiveSort.field]
+      const bv = b[effectiveSort.field]
+      // 空值 (null/undefined/'') 恒排最后, 与排序方向无关。
+      // 此前 `String(av ?? '')` 会把空值排到升序最前 — 双榜并集表
+      // (如舆情热度榜: 单边东财的股票同花顺字段为 null) 首屏全是 "—" 的根因。
+      const aMissing = av == null || av === ''
+      const bMissing = bv == null || bv === ''
+      if (aMissing && bMissing) return 0
+      if (aMissing) return 1
+      if (bMissing) return -1
       if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * factor
-      return String(av ?? '').localeCompare(String(bv ?? '')) * factor
+      return String(av).localeCompare(String(bv)) * factor
     })
-  }, [rows, menu?.default_sort])
+  }, [rows, effectiveSort])
+
+  // 表格/榜单模式下的行级搜索: 按任意列关键字过滤 (选个股/搜机构/搜评级通用)。
+  // 分组模式的 search 沿用原 filteredGroups, 互不影响。
+  const filteredTableRows = useMemo(() => {
+    if (!isTableMode || activeGroupField) return sortedRows
+    const q = search.trim().toLowerCase()
+    if (!q) return sortedRows
+    return sortedRows.filter(row =>
+      Object.values(row).some(v => v != null && String(v).toLowerCase().includes(q)),
+    )
+  }, [sortedRows, search, isTableMode, activeGroupField])
 
   const groups = useMemo<DimensionGroup[]>(() => {
-    if (!activeDimensionField || menu?.template === 'table' || menu?.template === 'ranking') return []
+    if (!activeGroupField) return []
     const map = new Map<string, Record<string, any>[]>()
     for (const row of sortedRows) {
-      const values = splitDimensionValues(row[activeDimensionField])
+      const values = splitDimensionValues(row[activeGroupField])
       for (const value of values) {
         const item = map.get(value) ?? []
         item.push(row)
@@ -233,7 +282,7 @@ export function ExtDimensionAnalysis({
         metrics: Object.fromEntries(groupColumns.map(col => [col.field, aggregate(itemRows, col)])),
       }))
       .sort((a, b) => b.count - a.count)
-  }, [sortedRows, activeDimensionField, groupColumns, menu?.template])
+  }, [sortedRows, activeGroupField, groupColumns])
 
   const filteredGroups = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -242,7 +291,16 @@ export function ExtDimensionAnalysis({
   }, [groups, search])
 
   const currentGroup = filteredGroups.find(g => g.key === selectedGroup) ?? filteredGroups[0]
-  const tableRows = menu?.template === 'table' || menu?.template === 'ranking' ? sortedRows : (currentGroup?.rows ?? [])
+  const tableRows = activeGroupField ? (currentGroup?.rows ?? []) : filteredTableRows
+
+  // 列头点击排序: 同列切换方向; 新列数值默认降序、文本默认升序。
+  const toggleSort = (field: string) => {
+    setUserSort(prev => {
+      if (prev?.field === field) return { field, order: prev.order === 'asc' ? 'desc' : 'asc' }
+      const col = displayColumns.find(c => c.field === field)
+      return { field, order: col?.type === 'number' || col?.sortable ? 'desc' : 'asc' }
+    })
+  }
   const coveredSymbols = useMemo(() => {
     const set = new Set<string>()
     rows.forEach(r => { if (r.symbol) set.add(String(r.symbol)) })
@@ -254,20 +312,11 @@ export function ExtDimensionAnalysis({
     <>
       <PageHeader
         title={activeTitle}
-        subtitle={menu ? `${menu.template} · ${menu.data_source}` : subtitle}
+        subtitle={menu ? `${menu.template} · ${activeConfigId}` : subtitle}
         right={
-          <div className="flex items-center gap-2">
-            <select
-              value={activeConfigId}
-              onChange={(e) => { setSelectedConfigId(e.target.value); setDimensionField(''); setSelectedGroup(null) }}
-              className="h-8 min-w-40 rounded-btn border border-border bg-surface px-2 text-xs text-foreground focus:outline-none focus:border-accent/50"
-            >
-              {availableConfigs.length === 0 ? (
-                <option value="">暂无扩展数据</option>
-              ) : availableConfigs.map(config => (
-                <option key={config.id} value={config.id}>{config.label}</option>
-              ))}
-            </select>
+          // 数据源不再由右上角切换 (侧栏每个信息面都是独立入口);
+          // 维度字段仅分组模式有效, table/ranking 模式不渲染。
+          !isTableMode ? (
             <select
               value={activeDimensionField}
               onChange={(e) => { setDimensionField(e.target.value); setSelectedGroup(null) }}
@@ -280,7 +329,7 @@ export function ExtDimensionAnalysis({
                 <option key={field.name} value={field.name}>{field.label || field.name}</option>
               ))}
             </select>
-          </div>
+          ) : null
         }
       />
 
@@ -315,7 +364,12 @@ export function ExtDimensionAnalysis({
           <>
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
               <StatCard label="数据源" value={activeConfig.label} hint={`${activeConfig.mode === 'snapshot' ? '快照' : '时序'} · ${activeConfig.id}`} icon={Database} />
-              <StatCard label="分组数量" value={groups.length || '—'} hint={activeDimensionField ? `按 ${fieldLabel(fields, activeDimensionField)} 聚合` : '未配置分组字段'} icon={Tags} />
+              <StatCard
+                label="分组数量"
+                value={activeGroupField ? groups.length : '—'}
+                hint={activeGroupField ? `按 ${fieldLabel(fields, activeGroupField)} 聚合` : '未分类 — 在明细列表右上选「分类」字段'}
+                icon={Tags}
+              />
               <StatCard label="覆盖标的" value={coveredSymbols || rows.length} hint={rowsQuery.data?.date ? `数据日期 ${rowsQuery.data.date}` : '当前快照'} icon={Users} />
               <StatCard label="列表列数" value={displayColumns.length} hint={`配置列 ${displayColumns.length} 个`} icon={TrendingUp} />
             </div>
@@ -326,8 +380,8 @@ export function ExtDimensionAnalysis({
               </div>
             )}
 
-            <div className={menu?.template === 'table' || menu?.template === 'ranking' ? 'grid grid-cols-1' : 'grid grid-cols-1 xl:grid-cols-[24rem_1fr] gap-5'}>
-              {menu?.template !== 'table' && menu?.template !== 'ranking' && (
+            <div className={activeGroupField ? 'grid grid-cols-1 xl:grid-cols-[24rem_1fr] gap-5' : 'grid grid-cols-1'}>
+              {activeGroupField && (
                 <section className="rounded-card border border-border bg-surface overflow-hidden">
                   <div className="px-4 py-3 border-b border-border flex items-center justify-between gap-3">
                     <div>
@@ -385,12 +439,38 @@ export function ExtDimensionAnalysis({
                 <div className="px-5 py-4 border-b border-border flex items-center justify-between gap-4">
                   <div>
                     <div className="flex items-center gap-2">
-                      <h3 className="text-[16px] leading-6 font-semibold text-foreground">{menu?.template === 'table' || menu?.template === 'ranking' ? '明细列表' : currentGroup?.key ?? `选择${activeKindLabel}`}</h3>
+                      <h3 className="text-[16px] leading-6 font-semibold text-foreground">{activeGroupField ? currentGroup?.key ?? `选择${activeKindLabel}` : '明细列表'}</h3>
                       <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] text-accent">{tableRows.length} 条</span>
                     </div>
                     <p className="mt-1 text-xs text-muted">列来自菜单 detail_columns：{displayColumns.map(f => f.label || f.field).join(' / ') || '暂无字段'}</p>
                   </div>
                   <div className="hidden sm:flex items-center gap-2 text-[11px] text-muted">
+                    {isTableMode && (
+                      <>
+                        <select
+                          value={groupBy}
+                          onChange={(e) => { setGroupBy(e.target.value); setSelectedGroup(null); setSearch('') }}
+                          className="h-8 min-w-24 rounded-btn border border-border bg-base px-2 text-xs text-foreground focus:outline-none focus:border-accent/50"
+                          title="按该字段的值分组，左侧生成分组榜单"
+                        >
+                          <option value="">分类：无</option>
+                          {dimensionOptions.map(field => (
+                            <option key={field.name} value={field.name}>分类：{field.label || field.name}</option>
+                          ))}
+                        </select>
+                        {!activeGroupField && (
+                          <div className="relative mr-2">
+                            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted" />
+                            <input
+                              value={search}
+                              onChange={(e) => setSearch(e.target.value)}
+                              placeholder="搜个股 / 代码 / 任意关键字"
+                              className="h-8 w-56 rounded-btn border border-border bg-base pl-8 pr-3 text-xs text-foreground placeholder:text-muted/50 focus:outline-none focus:border-accent/50"
+                            />
+                          </div>
+                        )}
+                      </>
+                    )}
                     <CalendarDays className="h-3.5 w-3.5" />
                     {rowsQuery.data?.date ?? '当前快照'}
                   </div>
@@ -401,7 +481,19 @@ export function ExtDimensionAnalysis({
                     <thead className="bg-elevated/50 text-[11px] text-muted">
                       <tr>
                         {displayColumns.map(col => (
-                          <th key={col.field} className="whitespace-nowrap px-4 py-2 font-medium" style={col.width ? { width: col.width } : undefined}>{col.label || col.field}</th>
+                          <th key={col.field} className="whitespace-nowrap px-4 py-2 font-medium" style={col.width ? { width: col.width } : undefined}>
+                            <button
+                              type="button"
+                              onClick={() => toggleSort(col.field)}
+                              title="点击排序 (再点切换方向)"
+                              className="inline-flex items-center gap-1 hover:text-foreground transition-colors"
+                            >
+                              <span>{col.label || col.field}</span>
+                              {effectiveSort?.field === col.field && (
+                                <span className="text-[9px] text-accent">{effectiveSort.order === 'asc' ? '▲' : '▼'}</span>
+                              )}
+                            </button>
+                          </th>
                         ))}
                       </tr>
                     </thead>
@@ -413,7 +505,7 @@ export function ExtDimensionAnalysis({
                       ) : tableRows.slice(0, 300).map((row, i) => (
                         <tr key={`${row.symbol ?? row.code ?? i}-${i}`} className="hover:bg-elevated/30">
                           {displayColumns.map(col => (
-                            <td key={col.field} className={`whitespace-nowrap px-4 py-2 ${col.field === activeDimensionField ? 'max-w-[18rem] truncate text-secondary' : col.field === 'symbol' || col.field === 'code' || col.field === '股票代码' ? 'font-mono text-secondary' : 'text-foreground'}`}>
+                            <td key={col.field} className={`whitespace-nowrap px-4 py-2 ${col.field === (activeGroupField || activeDimensionField) ? 'max-w-[18rem] truncate text-secondary' : col.field === 'symbol' || col.field === 'code' || col.field === '股票代码' ? 'font-mono text-secondary' : 'text-foreground'}`}>
                               {formatValue(row[col.field], col)}
                             </td>
                           ))}

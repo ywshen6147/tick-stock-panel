@@ -145,6 +145,65 @@ function num(v) {
 }
 
 /**
+ * 把上游成交量统一折算成**手**（内部契约）。
+ *
+ * 背景（2026-10-13 实测定位）：腾讯 qt.gtimg.cn 的成交量字段**单位不统一** ——
+ * 688 开头（科创板）返回「股」，其余（沪深主板/创业板/北交所）返回「手」；
+ * 新浪 getHQNodeData / getKLineData 则恒为「股」。
+ * 若不收口，科创板标的的成交量会整体放大 100 倍，直接污染更下游的
+ * intraday_history（vwap 缩小 100 倍、vol_rel_5m 出现负值），进而误导 LLM 决策。
+ *
+ * 判定优先用「成交额 ÷ 现价 ≈ 股数」自校验（对任何上游口径都成立，且天然幂等）：
+ *   ratio = volume / (amount / price)  —— ≈1 说明 volume 是「股」，≈0.01 说明已是「手」。
+ * 无法判定（停牌/新上市 amount 缺失）时，退回板块规则（688/689 → 股）。
+ *
+ * @param {*} volume    上游成交量
+ * @param {*} amountWan 上游成交额（**万元**，与腾讯字段口径一致）
+ * @param {*} price     现价（元）
+ * @param {*} code      代码（不带前缀，如 "688553"）
+ * @param {boolean} isIndex 是否指数（指数跳过自校验, 见下方说明）
+ */
+function toHands(volume, amountWan, price, code, isIndex) {
+  const v = num(volume)
+  if (v == null) return null
+  if (v <= 0) return v
+  // 指数不能走「成交额÷现价」自校验: 指数的"价格"是点数, 该比值无任何含义,
+  // 会得到随机数并误判(实测 000001.SH 会被误判为「股」再 ÷100, 造成 100 倍误差)。
+  // 腾讯对指数统一返回「手」(与自家 kline_index_daily 一致) → 原值透传。
+  if (isIndex) return v
+  const amt = num(amountWan)
+  const p = num(price)
+  if (amt != null && amt > 0 && p != null && p > 0) {
+    const shares = (amt * 1e4) / p // 万元 → 元, 再 ÷ 现价 ≈ 股数
+    if (shares > 0) {
+      const ratio = v / shares
+      if (ratio > 0.1) return v / 100 // 明显是「股」→ 折成「手」
+      return v // 已是「手」
+    }
+  }
+  return /^68[89]/.test(String(code || '')) ? v / 100 : v
+}
+
+/**
+ * app 符号是否指数。
+ *
+ * 只有两个组合会被指数占用、A 股股票绝不会使用:
+ *   - `.SH` + `000xxx` (上证系列: 000001 上证指数 / 000300 沪深300 / 000680 科创综指 …)
+ *   - `.SZ` + `399xxx` (深证系列: 399001 深证成指 / 399006 创业板指 …)
+ * 注意 000001.SZ 是「平安银行」股票, 000001.SH 才是上证指数 —— 必须带上后缀判断。
+ */
+function isIndexApp(appSymbol) {
+  const s = String(appSymbol || '')
+  const dot = s.lastIndexOf('.')
+  if (dot === -1) return false
+  const code = s.slice(0, dot)
+  const suffix = s.slice(dot + 1).toUpperCase()
+  if (suffix === 'SH') return /^000\d{3}$/.test(code)
+  if (suffix === 'SZ') return /^399\d{3}$/.test(code)
+  return false
+}
+
+/**
  * 上游(东财)偶发冷启动/限流时对活跃标的返回空数组(非报错)。对已知应有数据的请求，
  * 空结果重试若干次以提升鲁棒性；真正无数据(退市/停牌/区间无交易)时多花几次调用可接受。
  */
@@ -387,15 +446,18 @@ async function opRealtime(sdk, job) {
     const rows = []
     for (const q of quotes || []) {
       if (!q || !q.code) continue
+      const appSym = toAppSymbol(q.code, q.marketId)
       rows.push({
-        symbol: toAppSymbol(q.code, q.marketId),
+        symbol: appSym,
         name: q.name,
         last_price: q.price,
         prev_close: q.prevClose,
         open: q.open,
         high: q.high,
         low: q.low,
-        volume: q.volume,
+        // 腾讯成交量单位随板块而异（688 为股、其余为手），统一折算为「手」再外发。
+        // 指数走独立豁免（腾讯指数统一为手、且自校验对其无意义）。
+        volume: toHands(q.volume, q.amount, q.price, q.code, isIndexApp(appSym)),
         amount: q.amount,
         change_pct: q.changePercent,
         timestamp: q.timestamp,
@@ -412,19 +474,24 @@ async function opRealtime(sdk, job) {
     // 新浪失败时回退到原 stock-sdk 路径（可能需要 linkdiary）
     process.stderr.write(`[bridge] sina all-a failed: ${(e && e.message) || e}\n`)
     const all = await sdk.batch.cn({ concurrency: job.concurrency || 8 })
-    raw = (all || []).map((q) => ({
-      symbol: toAppSymbol(q.code, q.marketId),
-      name: q.name,
-      last_price: q.price,
-      prev_close: q.prevClose,
-      open: q.open,
-      high: q.high,
-      low: q.low,
-      volume: q.volume,
-      amount: q.amount,
-      change_pct: q.changePercent,
-      timestamp: q.timestamp,
-    }))
+    raw = (all || []).map((q) => {
+      const appSym = toAppSymbol(q.code, q.marketId)
+      return {
+        symbol: appSym,
+        name: q.name,
+        last_price: q.price,
+        prev_close: q.prevClose,
+        open: q.open,
+        high: q.high,
+        low: q.low,
+        // 新浪失败回退到 sdk.batch.cn 时同样走腾讯口径 → 用 toHands 统一折成「手」。
+        // 历史 BUG: 这里直接透传 q.volume，科创板标的(如 688553)会放大 100 倍。
+        volume: toHands(q.volume, q.amount, q.price, q.code, isIndexApp(appSym)),
+        amount: q.amount,
+        change_pct: q.changePercent,
+        timestamp: q.timestamp,
+      }
+    })
     const rows = []
     for (const it of raw || []) {
       if (!it || !it.symbol) continue

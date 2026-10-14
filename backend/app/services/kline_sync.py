@@ -584,6 +584,28 @@ def _merge_adj_factor_store(out: Path, new_data: pl.DataFrame) -> tuple[int, lis
     """
     out.parent.mkdir(parents=True, exist_ok=True)
     new_data = _align_adj_factor_frame(new_data)
+
+    # ── 垃圾闸 (2026-10-14 事故教训) ──
+    # 上游 tickflow ex_factors 曾把"每日快照因子"当除权事件整批返回:
+    # 全市场同日 4000+ 行、dividend/bonus/allot 明细全空、因子值荒谬
+    # (负数 / 上万)。这类数据一旦入库, enriched 按事件连乘后会把标的
+    # 一个月前的价格压成 1/65 (688553: raw 11.89 → 前复权 0.18)。
+    # 真实除权高峰日 (年报分红季) 全市场也 < 300 家/日, 阈值取
+    # max(300, 30% 标的数) 拦垃圾不误伤; 触发时整批拒收并抛错,
+    # 宁可本轮无复权 (enriched 退回未复权) 也不吃垃圾。
+    if not new_data.is_empty():
+        n_syms = new_data["symbol"].n_unique()
+        threshold = max(300, int(n_syms * 0.3))
+        per_day = new_data.group_by("trade_date").len().sort("len", descending=True)
+        suspicious = per_day.filter(pl.col("len") > threshold)
+        if suspicious.height:
+            top = suspicious.head(3).rows()
+            raise ValueError(
+                "adj_factor 拒收: 单日事件行数超阈值 (阈值 %d, 标的 %d 只), "
+                "疑似每日快照/垃圾数据而非真实除权事件; TOP3 %s"
+                % (threshold, n_syms, top)
+            )
+
     if not out.exists():
         _atomic_write_parquet(new_data.sort(["symbol", "trade_date"]), out)
         return new_data.height, sorted(new_data["symbol"].unique().to_list())
@@ -648,6 +670,11 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
                 factor_dir = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
                 added, affected = _merge_adj_factor_store(
                     repo.store.data_dir / factor_dir / "all.parquet", new_data
+                )
+                # 自定义源合并路径原先静默无日志, 垃圾因子写回时完全不可见 (2026-10-14 事故)。
+                logger.info(
+                    "adj_factor[%s] custom provider %s merged: +%d rows, %d changed symbols, %d fetched",
+                    asset_type, provider_name, added, len(affected), new_data.height,
                 )
                 return added, affected
         # 自定义源未配置 adj_factor → 回退 TickFlow

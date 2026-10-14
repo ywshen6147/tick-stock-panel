@@ -623,7 +623,11 @@ class KlineRepository:
                 df_hist = guarded_collect(lf.select(read_cols), priority="background")
                 logger.info("enriched refresh step done: collect history rows=%d (%.2fs)", len(df_hist), time.perf_counter() - step)
                 if not df_hist.is_empty():
-                    instruments = self._instruments_cache if self._instruments_cache is not None else pl.DataFrame()
+                    # 防御: 用 get_instruments() 而非裸读 _instruments_cache。
+                    # clear_cache() 会把 instruments 一并清空, 若此时才懒重建 enriched,
+                    # 裸读会拿到空表 → compute_limit_signals 被整体跳过 →
+                    # signal_limit_up / limit_up_price 列丢失 (连板梯队涨停数变 0 的根因)。
+                    instruments = self.get_instruments()
 
                     # 分批计算并关联元数据, 保留完整历史, 限制宽表临时副本。
                     step = time.perf_counter()
