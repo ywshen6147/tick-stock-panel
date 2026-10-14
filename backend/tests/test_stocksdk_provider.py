@@ -170,6 +170,12 @@ def test_bridge_mjs_resolves_local_sdk_and_maps_realtime_timestamp(tmp_path):
       volume: 16325, amount: 159095, changePercent: 0.5,
       timestamp: 1787193740000
     }] }
+    this.quotes = { cn: async () => [{
+      code: '600519', marketId: '1', name: '贵州茅台', price: 1200,
+      prevClose: 1194, open: 1186, high: 1203, low: 1180,
+      volume: 16325, amount: 159095, changePercent: 0.5,
+      timestamp: 1787193740000
+    }] }
   }
 }
 """,
@@ -188,9 +194,12 @@ def test_bridge_mjs_resolves_local_sdk_and_maps_realtime_timestamp(tmp_path):
     assert proc.returncode == 0
     result = json.loads(proc.stdout)
     assert result == {"ok": True, "op": "ping", "version": "fake-local"}
+    # 显式传 symbols → 走腾讯单股报价路径 (sdk.quotes.cn)。
+    # 不传 symbols 会走本地新增的「新浪全市场翻页」默认路径 (真实网络抓取),
+    # 单测里既慢又不可控, 故此处置为显式 symbols。
     realtime_proc = subprocess.run(
         ["node", str(bridge_path)],
-        input=json.dumps({"op": "realtime"}),
+        input=json.dumps({"op": "realtime", "symbols": ["600519.SH"]}),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -198,6 +207,7 @@ def test_bridge_mjs_resolves_local_sdk_and_maps_realtime_timestamp(tmp_path):
     )
     assert realtime_proc.returncode == 0
     row = json.loads(realtime_proc.stdout)["rows"][0]
+    assert row["symbol"] == "600519.SH"
     assert row["timestamp"] == 1787193740000
 
 

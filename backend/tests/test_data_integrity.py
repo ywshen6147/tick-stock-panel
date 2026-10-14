@@ -9,7 +9,6 @@ import time
 from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
 
-import app.data_providers
 import polars as pl
 import pytest
 

@@ -50,7 +50,10 @@ def test_build_messages_only_contains_whitelisted_fields():
     for field in ("ma20", "rsi_14", "boll_upper"):
         assert field in field_section
     # 字段清单里出现的每个 key( 都必须在白名单内 (物理列 ∪ 因子)
-    keys = set(re.findall(r"([a-z0-9_]+)\(", field_section))
+    # 只在「列表位置」(行首 / 分组后 "xxx: " / 逗号分隔) 抓取 id, 并允许大写:
+    #   扩展数据字段名可能含大写 (如 ext_..._FDR001 / ext_..._Delta),
+    #   且字段描述自身可能含括号 (如 ETF期权(T型+希腊)), 朴素 [a-z0-9_]+\( 会误切.
+    keys = set(re.findall(r"(?m)(?:^|[:：]\s+|,\s+)([A-Za-z0-9_]+)\(", field_section))
     assert keys and keys <= allowed_fields()
 
 
@@ -61,7 +64,7 @@ def test_build_messages_contains_factor_fields():
     system = build_messages("动量强的票")[0]["content"]
     field_section = system.split("运算符（op）", 1)[0]
     factor_ids = {s.id for s in all_factors()}
-    listed = set(re.findall(r"([a-z0-9_]+)\(", field_section))
+    listed = set(re.findall(r"(?m)(?:^|[:：]\s+|,\s+)([A-Za-z0-9_]+)\(", field_section))
     assert factor_ids & listed, "提示词应包含至少一个因子字段"
     assert "因子·动量" in field_section
     assert "预计算的因子值" in system

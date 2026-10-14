@@ -8,7 +8,9 @@ get_realtime_indices(symbols) 补拉指数 — A 股快照普遍不含指数
 
 from __future__ import annotations
 
+import tempfile
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -206,11 +208,17 @@ def _injection_env(monkeypatch, *, healthy, local_df, asset_type="stock", symbol
     service = qs.QuoteService()
     service._repo = SimpleNamespace(
         get_minute_batch=lambda syms, d: local_df,
+        store=SimpleNamespace(data_dir=Path(tempfile.mkdtemp(prefix="tsp-intraday-"))),
     )
     engine = SimpleNamespace(
         intraday_signal_symbols=lambda at: set(symbols) if at == asset_type else set(),
     )
-    minute_svc = SimpleNamespace(is_healthy=lambda: healthy)
+    # writes_main_partition: quote_service 的本地读门禁 —— 仅当分钟服务维护
+    # kline_minute 主分区时才读本地; 合成源(stocksdk 快照)写独立目录须回落 API。
+    minute_svc = SimpleNamespace(
+        is_healthy=lambda: healthy,
+        writes_main_partition=lambda: True,
+    )
     service._app_state = SimpleNamespace(minute_refresh=minute_svc)
 
     import app.services.quote_service as qsm
