@@ -38,7 +38,9 @@ def test_get_daily_normalizes_and_echoes_symbol(monkeypatch):
         }},
     })
     df = StockSDKProvider().get_daily(["600519.SH"], dt.datetime(2026, 1, 1), dt.datetime(2026, 1, 15))
-    assert df.columns == ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
+    # 批量日K为权威历史: quote_ts 必须存在且全 null (data_integrity 语义约定)
+    assert df.columns == ["symbol", "date", "open", "high", "low", "close", "volume", "amount", "quote_ts"]
+    assert df["quote_ts"].null_count() == df.height
     assert df.height == 2
     assert df["symbol"].unique().to_list() == ["600519.SH"]
     assert df.schema["date"] == pl.Date

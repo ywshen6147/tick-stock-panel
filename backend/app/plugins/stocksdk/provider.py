@@ -182,6 +182,12 @@ class StockSDKProvider:
                     continue
                 df = normalize_daily(rows, default_symbol=sym, source=self.name)
                 if not df.is_empty():
+                    # 东财日K行的 timestamp 是「K线日期零点」而非行情时刻, normalize_daily
+                    # 会把它改名为 quote_ts; 而 data_integrity 以 quote_ts 判盘中快照
+                    # (约定: null=权威历史, 当日时刻<15:30=盘中快照)。零点命中收盘线
+                    # 之前 → 整分区被误判「停机前的盘中快照」→ 每次重启都全市场重拉。
+                    # 批量日K是权威历史, quote_ts 必须为 null (仅实时 flush 写真实值)。
+                    df = df.with_columns(pl.lit(None, dtype=pl.Int64).alias("quote_ts"))
                     frames.append(df)
             if on_chunk_done:
                 on_chunk_done(i + 1, len(chunks))
