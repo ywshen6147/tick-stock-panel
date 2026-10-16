@@ -1014,6 +1014,18 @@ class QuoteService:
                 pl.col("quote_ts").is_null()
                 | pl.col("quote_ts").is_between(day_start_ms, day_start_ms + 86_400_000, closed="left")
             )
+        # 指数等源的快照**没有** open/high/low 字段 (新浪 s_ 指数只给现价/涨跌/量额),
+        # 记录里是显式 None → filter_halt_days 的 (open==0)&(high==0) 遇 null 得 null,
+        # Polars 把 null 掩码当 False 滤掉 → 指数每一轮都被误判「停牌」整批丢弃,
+        # 当日指数日K永不落盘 (分时却有当日数据), 表现为「指数分时与K线对不上」。
+        # 因此先用 close 填 null (只填 null, **不动 0**), 保证零值停牌判据仍生效。
+        null_fill = [
+            pl.when(pl.col(col).is_null()).then(pl.col("close")).otherwise(pl.col(col)).alias(col)
+            for col in ("open", "high", "low")
+            if col in result.columns
+        ]
+        if null_fill:
+            result = result.with_columns(null_fill)
         # 停牌/尚无集合竞价的记录 open/high 均为 0。必须在下方用 close 填充前
         # 过滤, 否则零成交行会被伪装成有效日K, 并在 batch 同步后作为实时残留
         # 反复触发历史完整性修复。

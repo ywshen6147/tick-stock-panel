@@ -215,6 +215,37 @@ def test_realtime_daily_builder_drops_halted_rows_before_zero_fill():
     assert result["symbol"].to_list() == ["600001.SH"]
 
 
+def test_realtime_daily_builder_keeps_index_rows_with_null_ohlc():
+    """回归: 指数快照无 open/high/low (新浪 s_ 指数只给现价/量额) → 显式 null。
+
+    filter_halt_days 的 (open==0)&(high==0) 遇 null 得 null, Polars 视作 False
+    会把整行滤掉 → 指数当日日K永不落盘, 而分时有当日数据 (2026-10-16 实测:
+    个股 today 分区已写、指数没有, 表现为「指数分时与K线对不上」)。
+    null 必须在停牌判据前用 close 回填; 0 值判据不受影响。
+    """
+    from app.services.quote_service import QuoteService
+
+    result = QuoteService._build_daily([
+        {
+            "symbol": "000001.SH", "last_price": 3742.66,
+            "open": None, "high": None, "low": None,
+            "volume": 284801200.0, "amount": 445406260000.0,
+            "timestamp": _ts_ms(cn_today(), time(11, 30)),
+        },
+        {   # 停牌个股 (零值判据) 仍须剔除
+            "symbol": "600002.SH", "last_price": 20.0,
+            "open": 0.0, "high": 0.0, "low": 0.0,
+            "volume": 0.0, "amount": 0.0,
+            "timestamp": _ts_ms(cn_today(), time(9, 15)),
+        },
+    ])
+
+    assert result["symbol"].to_list() == ["000001.SH"]
+    row = result.row(0, named=True)
+    # 无 OHLC 的源用 close 回填, 保证当日蜡烛成立
+    assert (row["open"], row["high"], row["low"]) == (3742.66, 3742.66, 3742.66)
+
+
 def test_realtime_daily_builder_drops_stale_snapshot_rows():
     """回归: 停牌股快照停留旧日, 不得复制成当日假蜡烛 (301266.SZ 2026-09-04)。
 
