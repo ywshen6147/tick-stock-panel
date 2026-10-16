@@ -310,6 +310,90 @@ def test_index_day_ohlc_resets_across_days():
     ] == (3720.0, 3720.0, 3720.0)
 
 
+def test_index_day_ohlc_seeds_from_minute_bars_after_restart():
+    """回归: 进程中途重启后, 累积器要用当日分钟K补回开盘价与已有振幅。
+
+    累积器是**进程内**状态。只靠快照的话, 重启后 open 会变成「重启那一刻的
+    价格」、high/low 只剩重启后的振幅 (2026-10-16 实测 12:50 重启即复现)。
+    分钟K的 OHLC 与权威日K逐字段一致, 故用它做种子。
+    """
+    from app.services.quote_service import QuoteService, _IndexDayOHLC
+
+    calls: list[tuple[str, object]] = []
+
+    def seeder(symbol: str, day: object):
+        calls.append((symbol, day))
+        return (3723.80, 3750.77, 3681.28)
+
+    acc = _IndexDayOHLC(seeder=seeder)
+    day = cn_today()
+
+    def snapshot(price: float) -> list[dict]:
+        return [{
+            "symbol": "000001.SH", "last_price": price,
+            "open": None, "high": None, "low": None,
+            "volume": 1000.0, "amount": 10000.0, "timestamp": _ts_ms(day, time(14, 0)),
+        }]
+
+    snap = snapshot(3730.0)
+    built = QuoteService._build_daily(snap, index_ohlc=acc.update(snap, day))
+    row = built.row(0, named=True)
+    # 开盘价/振幅来自分钟K, 收盘价来自最新快照
+    assert (row["open"], row["high"], row["low"], row["close"]) == (
+        3723.80, 3750.77, 3681.28, 3730.0,
+    )
+
+    # 只播种一次: 后续轮次不再重复拉分钟K
+    acc.update(snapshot(3741.5), day)
+    assert calls == [("000001.SH", day)]
+
+
+def test_index_day_ohlc_seeder_failure_falls_back_to_snapshot():
+    """播种失败(无分钟数据/取数异常)必须静默退回快照累积, 不能拖垮行情轮询。"""
+    from app.services.quote_service import QuoteService, _IndexDayOHLC
+
+    def boom(symbol: str, day: object):
+        raise RuntimeError("minute source down")
+
+    acc = _IndexDayOHLC(seeder=boom)
+    day = cn_today()
+    snap = [{
+        "symbol": "000001.SH", "last_price": 3720.0,
+        "open": None, "high": None, "low": None,
+        "volume": 1000.0, "amount": 10000.0, "timestamp": _ts_ms(day, time(10, 0)),
+    }]
+    row = QuoteService._build_daily(snap, index_ohlc=acc.update(snap, day)).row(0, named=True)
+    assert (row["open"], row["high"], row["low"], row["close"]) == (
+        3720.0, 3720.0, 3720.0, 3720.0,
+    )
+
+
+def test_index_close_reads_mixed_schema_partitions(tmp_path):
+    """回归: 指数日K分区不同构时, 模拟盘基准收盘价仍要能读到。
+
+    实时链路写的当日分区带 quote_ts, EOD 写的不带 —— 整表 scan 会因 schema
+    不一致直接抛错, 导致当日基准缺失、模拟盘结算静默失败 (2026-10-16 实测)。
+    """
+    from app.strategy.paper import _index_close
+
+    base = tmp_path / "kline_index_daily"
+    for ds, extra in (("2026-10-15", False), ("2026-10-16", True)):
+        d = base / f"date={ds}"
+        d.mkdir(parents=True)
+        data = {
+            "symbol": ["000300.SH"], "date": [date.fromisoformat(ds)],
+            "open": [4100.0], "high": [4200.0], "low": [4050.0],
+            "close": [4170.613], "volume": [1.0], "amount": [1.0],
+        }
+        if extra:  # 实时链路多写的列
+            data["quote_ts"] = [1792134041500]
+        pl.DataFrame(data).write_parquet(d / "part.parquet")
+
+    assert _index_close(tmp_path, "2026-10-16") == 4170.613
+    assert _index_close(tmp_path, "2026-10-15") == 4170.613
+    assert _index_close(tmp_path, "2026-10-14") is None
+
+
 def test_realtime_daily_builder_drops_stale_snapshot_rows():
     """回归: 停牌股快照停留旧日, 不得复制成当日假蜡烛 (301266.SZ 2026-09-04)。
 

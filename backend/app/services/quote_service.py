@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -71,11 +72,21 @@ class _IndexDayOHLC:
 
     故在服务内按 symbol 累积当日 OHLC —— open 取首价 (单调, 开盘后不再变),
     high/low 取极值 (单调), close 取最新价。跨日自动归零。
+
+    累积器是**进程内**状态, 进程中途重启就归零: 只看快照会把 open 当成「重启那一
+    刻的价格」、high/low 只剩重启后的振幅 (实测 12:50 重启即复现)。故允许注入
+    ``seeder`` —— 当日首次见到某 symbol 时用真实分钟K的首开/极值做种子; 取数失败
+    退回纯快照累积 (至少不比原来差)。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        seeder: Callable[[str, date], tuple[float, float, float] | None] | None = None,
+    ) -> None:
         self._day: date | None = None
         self._acc: dict[str, list[float]] = {}
+        self._tried: set[str] = set()   # 当日已尝试过播种的 symbol (失败不重试, 防抖)
+        self._seeder = seeder
         self._lock = threading.Lock()
 
     def update(self, records: list[dict], day: date) -> dict[str, tuple[float, float, float]]:
@@ -94,6 +105,23 @@ class _IndexDayOHLC:
             if self._day != day:
                 self._day = day
                 self._acc = {}
+                self._tried = set()
+            pending = [s for s, _ in prices if s not in self._acc and s not in self._tried]
+            self._tried.update(pending)
+        # 播种放在锁外 —— 走的是分钟K取数, 不能让 I/O 占着累积器锁。
+        for sym in pending:
+            if self._seeder is None:
+                break
+            try:
+                bar = self._seeder(sym, day)
+            except Exception as exc:  # noqa: BLE001 — 播种是增强, 失败静默退回快照
+                logger.debug("指数日K播种失败 %s: %s", sym, exc)
+                bar = None
+            if bar is None:
+                continue
+            with self._lock:
+                self._acc.setdefault(sym, [float(bar[0]), float(bar[1]), float(bar[2])])
+        with self._lock:
             for sym, px in prices:
                 cur = self._acc.get(sym)
                 if cur is None:
@@ -269,8 +297,9 @@ class QuoteService:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # 指数当日真实 OHLC 累积器 (实时源只给现价, 见 _IndexDayOHLC 文档)
-        self._index_day_ohlc = _IndexDayOHLC()
+        # 指数当日真实 OHLC 累积器 (实时源只给现价, 见 _IndexDayOHLC 文档)。
+        # 带播种器: 进程中途重启后累积器为空, 用当日分钟K补回开盘价与已有振幅。
+        self._index_day_ohlc = _IndexDayOHLC(seeder=self._seed_index_day_ohlc)
         # 串行化行情拉取: 手动 POST /refresh 与后台轮询线程可能并发调用
         # _fetch_quotes, 两者同时写同一批 parquet/缓存会互相覆盖
         self._fetch_lock = threading.Lock()
@@ -1029,6 +1058,32 @@ class QuoteService:
             if _r.get("enabled", True) and _r.get("asset_type") == "index" and _r.get("scope") == "symbols":
                 out.update(s for s in _r.get("symbols", []) if s)
         return out
+
+    def _seed_index_day_ohlc(self, symbol: str, day: date) -> tuple[float, float, float] | None:
+        """取当日真实分钟K的首开/极值, 给 _IndexDayOHLC 做种子。
+
+        只在「当日首次见到该 symbol 且累积器为空」时被调用一次; 分钟K的 OHLC 与
+        权威日K逐字段一致 (已与通达信对账), 所以这样能补回重启前那段的开盘价与
+        振幅。任何异常/无数据都返回 None —— 调用方会退回纯快照累积。
+        """
+        capset = getattr(self._app_state, "capabilities", None)
+        if capset is None:
+            return None
+        from app.services import kline_sync
+
+        df = kline_sync.fetch_minute_single(symbol, day, asset_type="index", capset=capset)
+        if df is None or df.is_empty():
+            return None
+        if not {"open", "high", "low"}.issubset(df.columns):
+            return None
+        if "datetime" in df.columns:
+            df = df.sort("datetime")
+        first_open = df["open"][0]
+        high = df["high"].max()
+        low = df["low"].min()
+        if first_open is None or high is None or low is None:
+            return None
+        return (float(first_open), float(high), float(low))
 
     @staticmethod
     def _build_daily(records: list[dict], index_ohlc: dict[str, tuple[float, float, float]] | None = None) -> pl.DataFrame:

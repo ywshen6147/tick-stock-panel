@@ -980,7 +980,13 @@ def _index_close(data_dir: Path, day: str) -> float | None:
         return None
     try:
         df = (
-            pl.scan_parquet((base / "**" / "*.parquet").as_posix())
+            # extra_columns="ignore": 指数日K分区并非同构 —— 实时链路写的当日分区
+            # 带 quote_ts (EOD 写的没有)。不给这个开关时整表 scan 直接抛
+            # 「extra column in file outside of expected schema」, 当日基准收盘价
+            # 读不到, 模拟盘结算静默失败。
+            pl.scan_parquet(
+                (base / "**" / "*.parquet").as_posix(), extra_columns="ignore"
+            )
             .filter((pl.col("symbol") == "000300.SH") & (pl.col("date") == _date.fromisoformat(day)))
             .select("close")
             .collect()
