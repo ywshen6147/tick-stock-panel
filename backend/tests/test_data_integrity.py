@@ -246,6 +246,70 @@ def test_realtime_daily_builder_keeps_index_rows_with_null_ohlc():
     assert (row["open"], row["high"], row["low"]) == (3742.66, 3742.66, 3742.66)
 
 
+def test_index_day_ohlc_accumulates_real_extremes():
+    """回归: 指数日K必须是当日真实 OHLC, 不是「最后一次轮询的现价」。
+
+    指数实时源(新浪 s_)只给现价, 没有 open/high/low。早前把现价复制成平蜡烛
+    写盘, 每轮又被 keep="last" 覆盖 → 日K 恒等于最后一次轮询那一刻的价:
+    2026-10-16 上证被写成 3726.94 平蜡烛, 而真值是
+    开 3723.80 / 高 3750.77 / 低 3716.46 (通达信对账)。分时图不受影响,
+    因为它走 fetch_minute_single 拉真实分钟K —— 故表现为「分时对、日K不对」。
+
+    累积器: open 取首价(单调), high/low 取极值(单调), close 取最新价。
+    """
+    from app.services.quote_service import QuoteService, _IndexDayOHLC
+
+    acc = _IndexDayOHLC()
+    day = cn_today()
+    stamp = _ts_ms(day, time(10, 0))
+
+    def snapshot(price: float) -> list[dict]:
+        return [{
+            "symbol": "000001.SH", "last_price": price,
+            "open": None, "high": None, "low": None,
+            "volume": 1000.0, "amount": 10000.0, "timestamp": stamp,
+        }]
+
+    # 开盘 → 冲高 → 回落 → 收在中途
+    seen = []
+    for price in (3723.80, 3750.77, 3716.46, 3728.70):
+        snap = snapshot(price)
+        built = QuoteService._build_daily(snap, index_ohlc=acc.update(snap, day))
+        assert built.height == 1, "累积的真实 OHLC 不应被停牌判据滤掉"
+        seen.append(built.row(0, named=True))
+
+    # open 恒定 = 首个盘中价
+    assert [r["open"] for r in seen] == [3723.80] * 4
+    # high/low 单调扩张到真实极值
+    assert seen[-1]["high"] == 3750.77
+    assert seen[-1]["low"] == 3716.46
+    # close 跟随最新价
+    assert [r["close"] for r in seen] == [3723.80, 3750.77, 3716.46, 3728.70]
+    # 不再是平蜡烛
+    assert not (
+        seen[-1]["open"] == seen[-1]["high"] == seen[-1]["low"] == seen[-1]["close"]
+    )
+
+
+def test_index_day_ohlc_resets_across_days():
+    """跨日必须归零, 否则昨天的极值会污染今天的 K 线。"""
+    from app.services.quote_service import _IndexDayOHLC
+
+    acc = _IndexDayOHLC()
+    yesterday, today = cn_today() - timedelta(days=1), cn_today()
+
+    acc.update([{"symbol": "000001.SH", "last_price": 3500.0}], yesterday)
+    acc.update([{"symbol": "000001.SH", "last_price": 3900.0}], yesterday)
+    assert acc.update([{"symbol": "000001.SH", "last_price": 3500.0}], yesterday)[
+        "000001.SH"
+    ] == (3500.0, 3900.0, 3500.0)
+
+    # 新的一天: 以当日首价为 open, 不继承昨日极值
+    assert acc.update([{"symbol": "000001.SH", "last_price": 3720.0}], today)[
+        "000001.SH"
+    ] == (3720.0, 3720.0, 3720.0)
+
+
 def test_realtime_daily_builder_drops_stale_snapshot_rows():
     """回归: 停牌股快照停留旧日, 不得复制成当日假蜡烛 (301266.SZ 2026-09-04)。
 

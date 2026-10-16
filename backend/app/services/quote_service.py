@@ -59,6 +59,54 @@ _FINAL_BOUNDARY = {"morning_final": dt_time(11, 30), "close_final": dt_time(15, 
 _FINAL_DEADLINE = {"morning_final": dt_time(12, 10), "close_final": dt_time(15, 30)}
 
 
+class _IndexDayOHLC:
+    """盘中累积指数当日真实 OHLC。
+
+    指数实时源 (新浪 s_) **只给现价**, 没有 open/high/low。此前把现价复制成
+    平蜡烛写进 kline_index_daily, 每次轮询又被 keep="last" 覆盖 → 日K 永远等于
+    「最后一次轮询那一刻的价格」, 与真实 OHLC 差之千里 (实测 2026-10-16 上证
+    被写成 3726.94 平蜡烛, 真值是 开3723.80/高3750.77/低3716.46)。
+
+    分时图之所以是对的: 它走 fetch_minute_single 拉真实分钟K, 不经过这里。
+
+    故在服务内按 symbol 累积当日 OHLC —— open 取首价 (单调, 开盘后不再变),
+    high/low 取极值 (单调), close 取最新价。跨日自动归零。
+    """
+
+    def __init__(self) -> None:
+        self._day: date | None = None
+        self._acc: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def update(self, records: list[dict], day: date) -> dict[str, tuple[float, float, float]]:
+        """并入本轮快照, 返回 {symbol: (open, high, low)} (不含 close)。"""
+        prices: list[tuple[str, float]] = []
+        for r in records:
+            sym = r.get("symbol")
+            px = r.get("last_price")
+            if not sym or px is None:
+                continue
+            try:
+                prices.append((sym, float(px)))
+            except (TypeError, ValueError):
+                continue
+        with self._lock:
+            if self._day != day:
+                self._day = day
+                self._acc = {}
+            for sym, px in prices:
+                cur = self._acc.get(sym)
+                if cur is None:
+                    # [open, high, low] —— open 一旦定下就不再变 (首个盘中价即开盘价)
+                    self._acc[sym] = [px, px, px]
+                else:
+                    if px > cur[1]:
+                        cur[1] = px
+                    if px < cur[2]:
+                        cur[2] = px
+            return {s: (v[0], v[1], v[2]) for s, v in self._acc.items()}
+
+
 def _body_with_quote(body: str, ev: dict) -> str:
     """推送正文尾部补上触发时的现价/涨跌幅 (日期提醒无行情, 自然为空)。
 
@@ -221,6 +269,8 @@ class QuoteService:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        # 指数当日真实 OHLC 累积器 (实时源只给现价, 见 _IndexDayOHLC 文档)
+        self._index_day_ohlc = _IndexDayOHLC()
         # 串行化行情拉取: 手动 POST /refresh 与后台轮询线程可能并发调用
         # _fetch_quotes, 两者同时写同一批 parquet/缓存会互相覆盖
         self._fetch_lock = threading.Lock()
@@ -944,7 +994,12 @@ class QuoteService:
         # 盘中 kline_index_enriched 停在上一交易日, 读侧守卫直接跳过不注入。
         # 指数为按码显式拉取 (部分标的) → merge 不截断分区。
         if self._repo:
-            index_daily_df = self._build_daily(index_records)
+            # 指数实时源(新浪 s_)只给现价 → 先并入当日真实 OHLC 累积器,
+            # 否则会写出「现价平蜡烛」并被每轮 keep="last" 覆盖 (见 _IndexDayOHLC)。
+            index_daily_df = self._build_daily(
+                index_records,
+                index_ohlc=self._index_day_ohlc.update(index_records, cn_today()),
+            )
             if not index_daily_df.is_empty():
                 try:
                     self._repo.merge_live_daily_asset("index", index_daily_df)
@@ -976,12 +1031,42 @@ class QuoteService:
         return out
 
     @staticmethod
-    @staticmethod
-    def _build_daily(records: list[dict]) -> pl.DataFrame:
-        """将 API records 转为日K格式 DataFrame (OHLCV + quote_ts, 写 kline_daily 用)。"""
+    def _build_daily(records: list[dict], index_ohlc: dict[str, tuple[float, float, float]] | None = None) -> pl.DataFrame:
+        """将 API records 转为日K格式 DataFrame (OHLCV + quote_ts, 写 kline_daily 用)。
+
+        index_ohlc: 指数当日累积 OHLC (见 _IndexDayOHLC)。指数实时源只给现价,
+        不传就用现价当 open/high/low —— 那是错的, 仅作无累积器时的兜底。
+        """
         if not records:
             return pl.DataFrame()
         df = pl.DataFrame(records)
+        # 指数: 用服务内累积的真实 OHLC 覆盖掉「只有现价」的伪 OHLC。
+        # 必须在 cols_map select **之前**做 —— 累积器里的 open/high/low 是权威值,
+        # 若放在后面, record 里的 None 已经占位, 下游 null→close 回填会再次
+        # 把三个字段压成平蜡烛。
+        if index_ohlc:
+            known = {s: v for s, v in index_ohlc.items() if s in set(df["symbol"].to_list())}
+            if known:
+                df = df.with_columns(
+                    pl.col("symbol").replace_strict(
+                        {s: v[0] for s, v in known.items()}, default=None, return_dtype=pl.Float64
+                    ).alias("_acc_open"),
+                    pl.col("symbol").replace_strict(
+                        {s: v[1] for s, v in known.items()}, default=None, return_dtype=pl.Float64
+                    ).alias("_acc_high"),
+                    pl.col("symbol").replace_strict(
+                        {s: v[2] for s, v in known.items()}, default=None, return_dtype=pl.Float64
+                    ).alias("_acc_low"),
+                )
+                for col in ("open", "high", "low"):
+                    acc = f"_acc_{col}"
+                    df = df.with_columns(
+                        pl.when(pl.col(acc).is_not_null())
+                        .then(pl.col(acc))
+                        .otherwise(pl.col(col) if col in df.columns else pl.lit(None, dtype=pl.Float64))
+                        .alias(col)
+                    )
+                df = df.drop([c for c in ("_acc_open", "_acc_high", "_acc_low") if c in df.columns])
         cols_map = {
             "symbol": "symbol",
             "last_price": "close",
