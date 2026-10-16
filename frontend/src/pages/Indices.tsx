@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Activity, Loader2, Lock, RefreshCw } from 'lucide-react'
@@ -8,12 +8,24 @@ import { useCapabilities } from '@/lib/useSharedQueries'
 import { EChartsCandlestick, type OHLC } from '@/components/EChartsCandlestick'
 import { EChartsIntraday } from '@/components/EChartsIntraday'
 
+/** 北京时区 YYYY-MM-DD。
+ *
+ * 不能用 `toISOString().slice(0,10)` —— 那是 UTC: 本地 00:00-08:00 之间会退回
+ * **前一天**, range.end 从此冻结在昨天, 日K 窗口右端 (end_date) 把当日行挡在
+ * 外面, 页面一整天只显示到昨天。 */
+function cnDate(d: Date = new Date()): string {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(d)
+  const get = (type: string) => parts.find(p => p.type === type)?.value ?? '01'
+  return `${get('year')}-${get('month')}-${get('day')}`
+}
+
 function defaultRange() {
-  const now = new Date()
-  const end = now.toISOString().slice(0, 10)
-  const s = new Date(now)
+  const end = cnDate()
+  const s = new Date()
   s.setMonth(s.getMonth() - 6)
-  return { start: s.toISOString().slice(0, 10), end }
+  return { start: cnDate(s), end }
 }
 
 function toOHLC(rows: KlineRow[]): OHLC[] {
@@ -69,6 +81,25 @@ export function Indices() {
   const [range, setRange] = useState(defaultRange)
   const [selectedDate, setSelectedDate] = useState<string | null>(null)
   const [linkedPrice, setLinkedPrice] = useState<number | null>(null)
+  // 用户是否手改过结束日期 — 改过就不再自动跟随「今天」(历史回放是明确意图)
+  const endTouchedRef = useRef(false)
+
+  // SPA 长驻: 标签页跨过零点后 range.end 仍停在昨天, 日K/分时永远缺当日。
+  // 未手改结束日期时, 每分钟 (以及窗口重新获得焦点时) 把 end 拉回今天。
+  useEffect(() => {
+    const roll = () => {
+      if (endTouchedRef.current) return
+      const today = cnDate()
+      setRange(r => (r.end === today ? r : { ...r, end: today }))
+    }
+    roll()
+    const timer = window.setInterval(roll, 60_000)
+    window.addEventListener('focus', roll)
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('focus', roll)
+    }
+  }, [])
 
   // 分时数据依赖分钟K批量数据 (kline.minute.batch)
   const caps = useCapabilities()
@@ -101,6 +132,11 @@ export function Indices() {
     queryFn: () => api.indexDaily(selectedSymbol, 180, range),
     enabled: !!selectedSymbol,
     placeholderData: (prev) => prev,
+    // 'index-daily' 不在 SSE 失效前缀里 (行情 tick 只刷 index-quotes), 落地即不动。
+    // 后端重启后实时缓存冷 / 当日分区尚未落盘时, 首次响应会缺当日行并被永久缓存
+    // → 页面停在昨天。1 分钟兜底重取; 数据未变时靠 React Query 结构化共享保持引用,
+    // 不会触发 K 线重绘。
+    refetchInterval: 60_000,
   })
 
   const minute = useQuery({
@@ -227,7 +263,7 @@ export function Indices() {
               <input
                 type="date"
                 value={range.end}
-                onChange={e => setRange(r => ({ ...r, end: e.target.value }))}
+                onChange={e => { endTouchedRef.current = true; setRange(r => ({ ...r, end: e.target.value })) }}
                 className="rounded-btn border border-border bg-base px-2 py-1 text-secondary outline-none focus:border-accent"
               />
             </div>
